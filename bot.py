@@ -271,12 +271,14 @@ async def _actor_closure(
 ):
     """Отчёт, который сейчас заполняет этот человек.
 
-    У мастера — свой единственный незавершённый.
-    У директора в чате мастеров — отчёт той заявки, на чей вопрос он нажал
-    или ответил реплаем. Фото без реплая — только к фото-шагу в этом чате.
+    У мастера может быть по незавершённому отчёту на разные заявки (СД на A
+    и закрытие B). Кнопка и реплай выбирают заявку; без якоря — последний
+    незавершённый. Чужой отчёт по реплаю мастер не перехватывает.
+    У директора — отчёт той заявки, на чей вопрос он нажал или ответил
+    реплаем. Фото без реплая — только к фото-шагу в этом чате.
     """
+    hinted = await _hinted_collecting_closure(hint_message_id, reply)
     if is_director:
-        hinted = await _hinted_collecting_closure(hint_message_id, reply)
         if hinted is not None:
             return hinted
         if not prefer_photo or chat_id is None:
@@ -289,6 +291,8 @@ async def _actor_closure(
         return photo_rows[0] if photo_rows else None
     if master is None:
         return None
+    if hinted is not None and int(hinted["employee_id"]) == int(master["employee_id"]):
+        return hinted
     return await db.active_closure(master["employee_id"])
 
 

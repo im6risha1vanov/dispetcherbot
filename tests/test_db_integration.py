@@ -51,7 +51,9 @@ def run_db(scenario):
         config.DATABASE_URL = TEST_DSN
         await db.connect()
         try:
-            await db._pool.execute("TRUNCATE assignments, shifts, requests, app_state, info_requests RESTART IDENTITY")
+            await db._pool.execute(
+                "TRUNCATE assignments, shifts, requests, app_state, info_requests, closures RESTART IDENTITY"
+            )
             # Справочник мастеров переживает TRUNCATE, поэтому чистим его руками:
             # иначе выключенный в одном тесте мастер ломает следующий.
             await db._pool.execute(
@@ -445,3 +447,29 @@ def test_состояние_переживает_перезапуск():
         return await db.get_state("rotation:206:2026-09-16")
 
     assert run_db(scenario) == "3"
+
+
+def test_сд_на_одной_заявке_не_блокирует_закрытие_другой():
+    """Collecting sd_open на A; close на B проходит; второй close на B — нет."""
+
+    async def scenario():
+        sd = await db.open_closure(783783, MASTER_A, -100, "sd_open")
+        first = await db.open_closure(784734, MASTER_A, -100, "close")
+        second = await db.open_closure(784734, MASTER_A, -100, "close")
+        still_sd = await db._pool.fetchrow(
+            "SELECT crm_id, kind, state FROM closures WHERE id = $1", sd["id"]
+        )
+        return (
+            sd["crm_id"],
+            sd["kind"],
+            first["crm_id"] if first else None,
+            first["kind"] if first else None,
+            second,
+            dict(still_sd),
+        )
+
+    sd_id, sd_kind, close_id, close_kind, blocked, leftover = run_db(scenario)
+    assert (sd_id, sd_kind) == (783783, "sd_open")
+    assert (close_id, close_kind) == (784734, "close")
+    assert blocked is None
+    assert leftover == {"crm_id": 783783, "kind": "sd_open", "state": "collecting"}

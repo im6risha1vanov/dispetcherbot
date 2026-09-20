@@ -638,7 +638,12 @@ async def mark_info_answered(request_id: int, answered_by: str) -> None:
 async def open_closure(
     crm_id: int, employee_id: int, chat_id: int, kind: str = "close"
 ) -> asyncpg.Record | None:
-    """Начинает отчёт. None — если у мастера уже есть незавершённый."""
+    """Начинает отчёт. None — если по этой заявке уже есть незавершённый.
+
+    СД на другой карточке не мешает: уникальность по (мастер, заявка),
+    не по мастеру целиком. Два закрытия одной и той же заявки по-прежнему
+    не стартуют параллельно.
+    """
     try:
         return await _pool.fetchrow(
             """
