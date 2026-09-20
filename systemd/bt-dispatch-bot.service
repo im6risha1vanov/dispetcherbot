@@ -1,0 +1,17 @@
+[Unit]
+Description=BT dispatch bot - Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=btbot
+WorkingDirectory=/opt/bt-dispatch-bot
+ExecStart=/opt/bt-dispatch-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

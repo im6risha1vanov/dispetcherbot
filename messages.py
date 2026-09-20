@@ -1,0 +1,292 @@
+"""Тексты и клавиатуры, общие для bot.py и poller.py."""
+
+from collections.abc import Mapping
+from typing import Any
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+import config
+
+CB_ENROUTE = "enroute"
+CB_ONSITE = "onsite"
+CB_PHONE = "phone"
+CB_APARTMENT = "apartment"
+CB_INWORK = "inwork"
+CB_CLOSE = "close"
+CB_SD = "sd"
+CB_SD_CLOSE = "sdclose"
+CB_REMOTE = "remote"
+CB_REMOTE_DONE = "remotedone"
+CB_CLOSE_ANSWER = "cans"
+CB_CLOSE_SKIP = "cskip"
+CB_CLOSE_OK = "cok"
+CB_CLOSE_NO = "cno"
+CB_MOVE = "move"
+CB_MOVE_TO = "moveto"
+CB_MOVE_CANCEL = "movecancel"
+CB_SHIFT_ON = "shift:on"
+
+
+def _when(rec: Mapping[str, Any]) -> str:
+    if not rec["opened_at"]:
+        return "время не указано"
+    return rec["opened_at"].astimezone(config.TIMEZONE).strftime("%d.%m.%y %H:%M")
+
+
+def request_text(rec: Mapping[str, Any], *, header: str = "📋 Заявка") -> str:
+    title = f"{header} #{rec['crm_id']}"
+    if rec.get("req_type"):
+        title += f" ({rec['req_type']})"
+
+    status = rec.get("status_text") or "—"
+    if rec.get("is_recall"):
+        status += " · отзывная"
+
+    lines = [title, f"{_when(rec)} · {status}"]
+    if rec.get("customer_name"):
+        lines.append(rec["customer_name"])
+    if rec.get("address"):
+        lines.append(rec["address"])
+    return "\n".join(lines)
+
+
+def master_keyboard(
+    crm_id: int, state: str, *, warranty: str = ""
+) -> InlineKeyboardMarkup | None:
+    """Шаг мастера плюс запрос номера. Кнопки отказа у мастера нет.
+
+    warranty: "" — обычная заявка, "ask" — гарантия до запроса номера,
+    "done" — номер уже получен, осталось подтвердить решение.
+    """
+    phone = InlineKeyboardButton(text="📞 Номер для дозвона", callback_data=f"{CB_PHONE}:{crm_id}")
+    apartment = InlineKeyboardButton(
+        text="🏠 Запрос квартиры", callback_data=f"{CB_APARTMENT}:{crm_id}"
+    )
+
+    if state == "assigned":
+        rows = [[InlineKeyboardButton(text="🚗 В пути", callback_data=f"{CB_ENROUTE}:{crm_id}")]]
+        # Гарантию иногда решают звонком — тогда ехать незачем.
+        if warranty == "ask":
+            rows.append([InlineKeyboardButton(
+                text="📞 Дистанционное решение", callback_data=f"{CB_REMOTE}:{crm_id}"
+            )])
+        elif warranty == "done":
+            rows.append([InlineKeyboardButton(
+                text="✅ Решено дистанционно", callback_data=f"{CB_REMOTE_DONE}:{crm_id}"
+            )])
+    elif state == "enroute":
+        rows = [
+            [InlineKeyboardButton(text="📍 На месте", callback_data=f"{CB_ONSITE}:{crm_id}")],
+            [phone],
+        ]
+    elif state == "onsite":
+        # Приехал и осматривает: квартиру спрашивают уже стоя у дома, а статус в
+        # CRM сменится только когда мастер реально приступит.
+        rows = [
+            [InlineKeyboardButton(text="🔧 В работе", callback_data=f"{CB_INWORK}:{crm_id}")],
+            [apartment],
+            [phone],
+        ]
+    elif state == "inwork":
+        # Приступив к работе, мастер либо закрывает заявку, либо забирает
+        # технику на сложную диагностику.
+        # Номер и квартира здесь уже не нужны: мастер на объекте и работает.
+        rows = [
+            [InlineKeyboardButton(text="✅ Закрыть заявку", callback_data=f"{CB_CLOSE}:{crm_id}")],
+            [InlineKeyboardButton(text="📦 В работе СД", callback_data=f"{CB_SD}:{crm_id}")],
+        ]
+    else:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+KIND_PHONE = "phone"
+KIND_APARTMENT = "apartment"
+KIND_REMOTE = "remote"
+
+_KINDS = {
+    KIND_PHONE: ("мс на месте номер для стыка", "📞", "Номер по заявке"),
+    KIND_APARTMENT: ("мс на месте кВ", "🏠", "Квартира по заявке"),
+    KIND_REMOTE: ("номер для дист решения", "📞", "Номер по заявке"),
+}
+
+
+def info_request_text(kind: str, rec: Mapping[str, Any], master_name: str) -> str:
+    """Короткий скрипт в том виде, как его привыкли читать диспетчеры."""
+    script, _, _ = _KINDS[kind]
+    return f"{rec['crm_id']} {script}"
+
+
+def info_answer_text(kind: str, crm_id: int, answer: str) -> str:
+    _, icon, title = _KINDS[kind]
+    return f"{icon} {title} #{crm_id}:\n{answer}"
+
+
+def _order_line(rec: Mapping[str, Any]) -> str:
+    """Строка заявки из CRM. Пока карточка не прочитана — собираем из грида."""
+    return rec.get("info_line") or request_text(rec, header="Заказ")
+
+
+def mention(rec: Mapping[str, Any]) -> str:
+    """Тег мастера: без него сообщение в общем чате легко пролистать."""
+    username = rec.get("telegram_username")
+    return f"@{username}\n" if username else ""
+
+
+def reminder_text(rec: Mapping[str, Any], minutes_left: int) -> str:
+    return mention(rec) + "⏰ Напоминание\n\n" + _order_line(rec)
+
+
+def _kind_note(rec: Mapping[str, Any]) -> str:
+    """Гарантию мастер должен видеть сразу: она оплачивается иначе."""
+    req_type = rec.get("req_type")
+    prior = rec.get("prior_master_name")
+    if req_type == "Гарантия":
+        note = "⚠️ ГАРАНТИЯ"
+        return f"{note} (первым был: {prior})\n" if prior else f"{note}\n"
+    if req_type == "Повтор" and prior:
+        return f"🔁 Повтор (первым был: {prior})\n"
+    return ""
+
+
+def assignment_text(rec: Mapping[str, Any], state: str) -> str:
+    hint = {
+        "assigned": f"\n\nВремя ожидания принятия — {config.ACCEPT_REMINDER_MIN} минут",
+        "enroute": "\n\nВ пути. Нажмите «На месте», когда приедете.",
+        "onsite": "\n\nНа месте. Нажмите «В работе», когда приступите.",
+        "inwork": "\n\nВ работе.",
+        "reassigned": "\n\nЗаявка передана другому мастеру.",
+    }[state]
+    prefix = (mention(rec) + _kind_note(rec)) if state == "assigned" else _kind_note(rec)
+    return prefix + _order_line(rec) + hint
+
+
+def move_keyboard(crm_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text="🔄 Передать другому", callback_data=f"{CB_MOVE}:{crm_id}")
+        ]]
+    )
+
+
+def master_choice_keyboard(crm_id: int, masters: list) -> InlineKeyboardMarkup:
+    """Выбор мастера вручную: на смене, с чатом, кроме текущего исполнителя."""
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{m['position']}. {m['full_name']}" + (" · занят" if m["is_busy"] else ""),
+            callback_data=f"{CB_MOVE_TO}:{crm_id}:{m['employee_id']}",
+        )]
+        for m in masters
+    ]
+    rows.append([InlineKeyboardButton(text="✖️ Отмена", callback_data=f"{CB_MOVE_CANCEL}:{crm_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def closing_keyboard(step) -> InlineKeyboardMarkup | None:
+    """Кнопки под вопросом: выбор вариантов или пропуск необязательного фото."""
+    if step.kind == "choice":
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=title, callback_data=f"{CB_CLOSE_ANSWER}:{step.key}:{value}")
+            for value, title in step.choices
+        ]])
+    if step.kind == "photo" and step.multi:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Готово", callback_data=f"{CB_CLOSE_SKIP}:{step.key}:-")
+        ]])
+    if step.kind == "photo" and not step.required:
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Пропустить", callback_data=f"{CB_CLOSE_SKIP}:{step.key}:-"
+            )
+        ]])
+    return None
+
+
+def closing_question(step, crm_id: int) -> str:
+    text = f"Закрытие заказа {crm_id}\n\n{step.question}"
+    if step.kind in ("amount", "text"):
+        text += "\n\n↩️ Ответьте на это сообщение."
+    return text
+
+
+def admin_decision_keyboard(closure_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"{CB_CLOSE_OK}:{closure_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"{CB_CLOSE_NO}:{closure_id}"),
+    ]])
+
+
+def payout_text(crm_id: int, payout: str) -> str:
+    return f"💰 Заказ {crm_id} закрыт\n\n{payout}"
+
+
+def shift_prompt_text(usernames: list[str] | None = None) -> str:
+    """Теги нужны, чтобы сбор смены не потерялся в общем чате."""
+    text = "Доброе утро. Кто на смене - нажмите +"
+    if usernames:
+        text += "\n\n" + " ".join(f"@{name}" for name in usernames)
+    return text
+
+
+def shift_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="➕ На смене", callback_data=CB_SHIFT_ON)]]
+    )
+
+
+def sd_close_offer(rec: Mapping[str, Any]) -> str:
+    return "Нашёл заявку:\n\n" + _order_line(rec)
+
+
+def sd_close_keyboard(crm_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Закрыть СД", callback_data=f"{CB_SD_CLOSE}:{crm_id}")
+    ]])
+
+
+def digest_text(day, totals, leftovers=()) -> str:
+    """Итоги дня: цифры из CRM, без домыслов, плюс что осталось незакрытым."""
+    head = f"📊 Итоги {day.strftime('%d.%m.%Y')}"
+
+    if totals["orders"]:
+        biggest = (
+            f"{_money(totals['biggest'])} — {totals['top_master'] or 'мастер не указан'}"
+            f" (заказ {totals['top_order']})"
+        )
+        body = (
+            f"Закрыто заявок: {totals['orders']}\n"
+            f"Оборот: {_money(totals['turnover'])}\n"
+            f"Средний чек: {_money(totals['average'])}\n"
+            f"Самый крупный: {biggest}"
+        )
+    else:
+        body = "Закрытых заявок нет."
+
+    return "\n\n".join([head, body] + _leftover_blocks(leftovers))
+
+
+def _leftover_blocks(leftovers) -> list[str]:
+    """Что к вечеру осталось в работе: незакрытое отдельно, диагностика отдельно."""
+    on_sd = [r for r in leftovers if r["on_sd"]]
+    hanging = [r for r in leftovers if not r["on_sd"]]
+
+    blocks = []
+    if hanging:
+        lines = "\n".join(
+            f"· {r['crm_id']} — {r['master_name'] or 'мастер не назначен'} ({r['status_text']})"
+            for r in hanging
+        )
+        blocks.append(f"⚠️ Не закрыто: {len(hanging)}\n{lines}")
+    else:
+        blocks.append("✅ Все заявки дня закрыты")
+
+    if on_sd:
+        lines = "\n".join(
+            f"· {r['crm_id']} — {r['master_name'] or 'мастер не назначен'}" for r in on_sd
+        )
+        blocks.append(f"📦 Забрали на сложную диагностику: {len(on_sd)}\n{lines}")
+    return blocks
+
+
+def _money(value) -> str:
+    return f"{int(value):,}".replace(",", " ") + " р."
