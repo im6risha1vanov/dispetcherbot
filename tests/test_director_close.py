@@ -27,12 +27,14 @@ def _bot(monkeypatch):
 
 def test_директор_это_telegram_id_а_не_мастер(monkeypatch):
     bot = _bot(monkeypatch)
+    kim_chat = -4935665842
 
     assert bot._is_director_user(DIRECTOR_USER) is True
     assert bot._is_director_user(MagicMock(id=111)) is False
+    # Заявки висят в рабочих чатах мастеров, не в утренней группе.
+    assert bot._director_closing(DIRECTOR_USER, kim_chat) is True
     assert bot._director_closing(DIRECTOR_USER, MASTERS_CHAT) is True
-    assert bot._director_closing(DIRECTOR_USER, 111) is False
-    assert bot._director_closing(MagicMock(id=111), MASTERS_CHAT) is False
+    assert bot._director_closing(MagicMock(id=111), kim_chat) is False
 
 
 def test_identify_master_директора_не_считает_мастером(monkeypatch):
@@ -200,3 +202,233 @@ def test_директор_не_в_списке_пропуска_очереди_�
     assert 708703366 in db_module._director_skip_ids()
     monkeypatch.setattr(db_module.config, "DIRECTOR_CHAT_ID", "")
     assert db_module._director_skip_ids() == set()
+
+
+KIM_CHAT = -4935665842
+
+
+def _director_callback(crm_id: int, chat_id: int = KIM_CHAT):
+    callback = AsyncMock()
+    callback.data = f"close:{crm_id}"
+    callback.from_user = MagicMock(id=708703366)
+    callback.message.chat.id = chat_id
+    callback.message.message_id = 10
+    callback.message.edit_reply_markup = AsyncMock()
+    callback.answer = AsyncMock()
+    callback.bot = AsyncMock()
+    callback.bot.send_message = AsyncMock(return_value=MagicMock(message_id=11))
+    return callback
+
+
+def test_on_close_start_директора_пишет_отчёт_за_назначенного(monkeypatch):
+    """Директор жмёт «Закрыть заявку» в чате Кима — closure.employee_id = 10679."""
+    bot = _bot(monkeypatch)
+    callback = _director_callback(784223)
+    assignment = {"id": 8, "employee_id": 10679, "crm_id": 784223}
+    closure = {
+        "id": 50, "crm_id": 784223, "employee_id": 10679,
+        "kind": closing.KIND_CLOSE, "chat_id": KIM_CHAT, "step": "payed",
+    }
+
+    async def scenario():
+        with patch.object(bot.db, "active_assignment", AsyncMock(return_value=assignment)), \
+             patch.object(bot.db, "open_closure", AsyncMock(return_value=closure)) as opened, \
+             patch.object(bot.db, "set_closure_step", AsyncMock()), \
+             patch.object(bot.db, "remember_closure_message", AsyncMock()):
+            await bot.on_close_start(callback)
+            return opened.await_args.args
+
+    assert asyncio.run(scenario()) == (784223, 10679, KIM_CHAT, closing.KIND_CLOSE)
+    callback.answer.assert_awaited()
+
+
+def test_директор_без_реплая_не_пишет_сумму(monkeypatch):
+    bot = _bot(monkeypatch)
+    message = AsyncMock()
+    message.from_user = MagicMock(id=708703366)
+    message.chat.id = KIM_CHAT
+    message.text = "1500"
+    message.reply_to_message = None
+    message.bot = AsyncMock()
+    theirs = {
+        "id": 50, "crm_id": 784223, "employee_id": 10679,
+        "kind": closing.KIND_CLOSE, "state": "collecting", "step": "payed",
+        "chat_id": KIM_CHAT,
+    }
+
+    async def scenario():
+        with patch.object(bot.db, "collecting_closure_by_message", AsyncMock(return_value=None)), \
+             patch.object(bot.db, "collecting_closures_in_chat", AsyncMock(return_value=[theirs])), \
+             patch.object(bot.db, "save_closure_answer", AsyncMock()) as saved:
+            await bot.on_closing_amount(message)
+            return saved.await_count
+
+    assert asyncio.run(scenario()) == 0
+
+
+def test_директор_реплаем_пишет_сумму_в_чужой_отчёт(monkeypatch):
+    bot = _bot(monkeypatch)
+    replied = MagicMock(
+        message_id=40,
+        text="Закрытие заказа 784223\n\nСколько оплатил клиент?",
+        caption=None,
+    )
+    replied.from_user = MagicMock(is_bot=True)
+    replied.reply_to_message = None
+    message = AsyncMock()
+    message.from_user = MagicMock(id=708703366)
+    message.chat.id = KIM_CHAT
+    message.text = "1500"
+    message.message_id = 41
+    message.reply_to_message = replied
+    message.bot = AsyncMock()
+    closure = {
+        "id": 50, "crm_id": 784223, "employee_id": 10679,
+        "kind": closing.KIND_CLOSE, "state": "collecting", "step": "payed",
+        "chat_id": KIM_CHAT,
+    }
+
+    async def scenario():
+        with patch.object(bot.db, "collecting_closure_by_message", AsyncMock(return_value=closure)), \
+             patch.object(bot.db, "closure_messages", AsyncMock(return_value=[40])), \
+             patch.object(bot.db, "save_closure_answer", AsyncMock()) as saved, \
+             patch.object(bot.db, "remember_closure_message", AsyncMock()), \
+             patch.object(bot, "_advance_closing", AsyncMock()) as advance:
+            await bot.on_closing_amount(message)
+            return saved.await_args.args, advance.await_count
+
+    args, advanced = asyncio.run(scenario())
+    assert args[0] == 50
+    assert args[1] == "payed_by_customer"
+    assert advanced == 1
+
+
+def test_директор_кладёт_фото_в_окно_crm(monkeypatch):
+    bot = _bot(monkeypatch)
+    message = AsyncMock()
+    message.from_user = MagicMock(id=708703366)
+    message.chat.id = KIM_CHAT
+    message.reply_to_message = None
+    message.photo = [MagicMock(file_id="tgfile-bso")]
+    message.message_id = 42
+    message.reply = AsyncMock(return_value=MagicMock(message_id=43))
+    photo_closure = {
+        "id": 50, "crm_id": 784223, "employee_id": 10679,
+        "kind": closing.KIND_CLOSE, "state": "collecting", "step": "bso_photo",
+        "chat_id": KIM_CHAT,
+    }
+
+    async def scenario():
+        with patch.object(bot.db, "collecting_closure_by_message", AsyncMock(return_value=None)), \
+             patch.object(
+                 bot.db, "collecting_closures_in_chat", AsyncMock(return_value=[photo_closure])
+             ), \
+             patch.object(bot.db, "add_closure_photo", AsyncMock()) as added, \
+             patch.object(bot.db, "remember_closure_message", AsyncMock()):
+            await bot.on_closing_photo(message)
+            return added.await_args.args
+
+    kind_args = asyncio.run(scenario())
+    assert kind_args == (50, "bso", "tgfile-bso")
+
+
+def test_закрытие_за_директора_rmw_мастера_и_finish(monkeypatch):
+    """Отчёт директора: карточка пишется как Ким, finish=1, id директора нет."""
+    from tests.test_crm_write import (
+        CLOSE_CARD, CONDUCTED_FOOTER, FakeCrm, _saved_close_card,
+    )
+    import config
+    from crm import FIELD_EMPLOYEE
+
+    assigned_close = CLOSE_CARD.replace(
+        '<option value="" selected>Выберите</option>',
+        '<option value="">Выберите</option>',
+    ).replace(
+        '<option value="10679">Габидуллин Ким (Сык) (650)</option>',
+        '<option value="10679" selected>Габидуллин Ким (Сык) (650)</option>',
+    ).replace(
+        '<input type="hidden" name="_employee_id" value="">',
+        '<input type="hidden" name="_employee_id" value="10679">',
+    )
+    saved = _saved_close_card().replace(
+        '<option value="" selected>Выберите</option>',
+        '<option value="">Выберите</option>',
+    ).replace(
+        '<option value="10679">Габидуллин Ким (Сык) (650)</option>',
+        '<option value="10679" selected>Габидуллин Ким (Сык) (650)</option>',
+    ).replace(
+        '<input type="hidden" name="_employee_id" value="">',
+        '<input type="hidden" name="_employee_id" value="10679">',
+    )
+    monkeypatch.setattr(config, "CRM_READ_ONLY", False)
+    monkeypatch.setattr(config, "CRM_WRITE_ONLY_FOR", frozenset())
+    crm = FakeCrm(card=assigned_close)
+    crm.card_after = saved
+    crm.card_finish = saved.replace(
+        """<select name="CustomerRequest[status]">
+    <option value="1" selected>Ожидает</option>
+    <option value="4">В пути</option>
+  </select>""",
+        CONDUCTED_FOOTER,
+    )
+    payload = closing.crm_payload({
+        "kind": closing.KIND_CLOSE,
+        "payed_by_customer": 1500,
+        "spares_cost": 0,
+        "with_bso": "1",
+        "fback_mode": "3",
+    })
+    assert FIELD_EMPLOYEE not in payload
+
+    async def scenario(c):
+        return await c.close_request(781594, payload, {"bso": ["tgfile1"]})
+
+    async def with_dl(c):
+        async def download(_fid):
+            return b"jpeg"
+        c._download_file = download
+        return await scenario(c)
+
+    from tests.test_crm_write import run_write as _run
+    damage = _run(crm, with_dl)
+    assert damage == []
+    assert "finish=1" in crm.write_urls[1]
+    for written in crm.writes:
+        if written.get("_multipart"):
+            continue
+        assert written.get(FIELD_EMPLOYEE) != "708703366"
+        assert written.get(FIELD_EMPLOYEE) == "10679"
+        assert written.get("_employee_id") != "708703366"
+
+
+def test_write_closing_директора_не_подменяет_мастера(monkeypatch):
+    bot = _bot(monkeypatch)
+    monkeypatch.setattr(bot.config, "CRM_ALLOW_CLOSING", True)
+    monkeypatch.setattr(bot.config, "ADMIN_CHAT_ID", "1")
+    closure = {
+        "id": 50,
+        "crm_id": 784223,
+        "kind": closing.KIND_CLOSE,
+        "employee_id": 10679,
+        "payed_by_customer": 1500,
+        "spares_cost": 0,
+        "with_bso": "1",
+        "fback_mode": "3",
+        "photos": {"bso": ["tgfile1"]},
+        "chat_id": KIM_CHAT,
+    }
+    crm = AsyncMock()
+    crm.close_request = AsyncMock(return_value=[])
+    tg = AsyncMock()
+
+    async def scenario():
+        with patch.object(bot.db, "mark_closure_written", AsyncMock()):
+            await bot._write_closing(tg, crm, closure)
+        return crm.close_request.await_args.args
+
+    args = asyncio.run(scenario())
+    assert args[0] == 784223
+    payload = args[1]
+    assert FIELD_EMPLOYEE not in payload
+    assert payload[closing.FIELD_PAYED] == "1500"
+    crm.assign_master.assert_not_called()

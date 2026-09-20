@@ -34,9 +34,9 @@ def _is_admin(message: Message) -> bool:
 async def identify_master(user):
     """Узнаёт мастера по telegram_id в справочнике.
 
-    Директор (@Dedoo4ek, DIRECTOR_CHAT_ID) — не мастер: заявок не получает,
-    в очередь смены не встаёт. Закрытие чужих заявок в чате мастеров
-    идёт отдельно, по telegram id, без строки в справочнике.
+    Директор (@Dedoo4ek, DIRECTOR_CHAT_ID) — не мастер: заявок не получает
+    и в очередь смены не встаёт. В рабочем чате мастера он закрывает чужую
+    заявку по telegram id, без строки в справочнике.
     При первом контакте мастера привязывает по заранее заданному @username.
     """
     if _is_director_user(user):
@@ -201,15 +201,13 @@ def _is_director_user(user) -> bool:
     return bool(wanted) and user is not None and str(user.id) == wanted
 
 
-def _in_masters_chat(chat_id) -> bool:
-    if not config.MASTERS_CHAT_ID:
-        return False
-    return str(chat_id) == str(config.MASTERS_CHAT_ID)
+def _director_closing(user, chat_id=None) -> bool:
+    """Директор закрывает чужие заявки там, где висит кнопка — в чате мастера.
 
-
-def _director_closing(user, chat_id) -> bool:
-    """Чужие заявки директор закрывает только в общем чате мастеров."""
-    return _is_director_user(user) and _in_masters_chat(chat_id)
+    Утренний MASTERS_CHAT_ID — сбор смены; сами заявки уходят в рабочие чаты,
+    где сидит и директор. Проверяем человека, не id утренней группы.
+    """
+    return _is_director_user(user)
 
 
 def _report_employee_id(actor, assignment, *, foreign_ok: bool = False, is_director: bool = False) -> int | None:
