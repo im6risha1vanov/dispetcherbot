@@ -253,7 +253,7 @@ def test_порча_соседних_полей_замечается(monkeypatch
     crm = FakeCrm()
     crm.card_after = ASSIGNED_CARD.replace(
         '<input name="CustomerRequest[payed_by_customer]" value="0">',
-        '<input name="CustomerRequest[payed_by_customer]" value="">',
+        '<input name="CustomerRequest[payed_by_customer]" value="1500">',
     )
 
     damage = []
@@ -331,7 +331,7 @@ def test_сотрудника_вне_селекта_crm_не_пишем(monkeypa
 
 
 def test_незаписанные_поля_закрытия_это_сбой_а_не_чужие():
-    """Пустой HTML после POST 0/3 — закрытие не легло, это не «задели чужое»."""
+    """Пустой селект после POST 3 — закрытие не легло, это не «задели чужое»."""
     before = {
         closing.FIELD_SPARES: "",
         closing.FIELD_FEEDBACK: "",
@@ -350,8 +350,30 @@ def test_незаписанные_поля_закрытия_это_сбой_а_�
     from crm import _classify_changes
     foreign, unpersisted = _classify_changes(before, after, intended)
     assert foreign == []
-    assert any("spares_cost" in d for d in unpersisted)
+    assert not any("spares_cost" in d for d in unpersisted), "пустое vs 0 у суммы не промах"
     assert any("fback_mode" in d for d in unpersisted)
+
+
+def test_пустой_html_нуля_оплаты_не_промах():
+    """Как 785236: POST 0, Yii number input остаётся value="" — это сохранённый ноль."""
+    from crm import _classify_changes
+    before = {closing.FIELD_PAYED: "", closing.FIELD_SPARES: ""}
+    intended = {closing.FIELD_PAYED: "0", closing.FIELD_SPARES: "0"}
+    after = {closing.FIELD_PAYED: "", closing.FIELD_SPARES: ""}
+    foreign, unpersisted = _classify_changes(before, after, intended)
+    assert foreign == []
+    assert unpersisted == []
+
+
+def test_ожидали_сумму_а_html_пустой_это_сбой():
+    """Реальный промах: ждали 1500, карточка так и пустая."""
+    from crm import _classify_changes
+    before = {closing.FIELD_PAYED: ""}
+    intended = {closing.FIELD_PAYED: "1500"}
+    after = {closing.FIELD_PAYED: ""}
+    foreign, unpersisted = _classify_changes(before, after, intended)
+    assert foreign == []
+    assert any("payed_by_customer" in d for d in unpersisted)
 
 
 def test_затирание_соседней_суммы_по_прежнему_замечается():
@@ -493,13 +515,11 @@ def test_закрытие_сначала_save_close_потом_finish(monkeypatc
 
 
 def test_ноль_и_нет_должны_выбраться_на_карточке(monkeypatch):
-    """Как 783806: оплата 0, БСО Нет, отзыв Нет, ZIP Нет — не «Выберите...»."""
+    """Как 785236: POST оплаты 0, HTML value="" — селекты Нет, закрытие доходит до finish=1."""
     monkeypatch.setattr(config, "CRM_READ_ONLY", False)
     monkeypatch.setattr(config, "CRM_WRITE_ONLY_FOR", frozenset())
     crm = FakeCrm(card=CLOSE_CARD)
-    saved = _saved_close_card(
-        payed="0", fback="2", fback_label="Нет", bso="0", bso_label="Нет",
-    )
+    saved = _saved_close_card(payed="", fback="2", bso="0", zip="0")
     crm.card_after = saved
     crm.card_finish = saved.replace(
         """<select name="CustomerRequest[status]">
@@ -531,11 +551,11 @@ def test_ноль_и_нет_должны_выбраться_на_карточк�
     assert crm.writes[0][closing.FIELD_BSO] == "0"
     assert crm.writes[0][closing.FIELD_FEEDBACK] == "2"
     assert crm.writes[0][closing.FIELD_ZIP] == "0"
-    assert card.fields[closing.FIELD_PAYED] == "0"
+    assert "finish=1" in crm.write_urls[1]
+    assert card.fields[closing.FIELD_PAYED] == ""
     assert card.labels[closing.FIELD_BSO] == "Нет"
     assert card.labels[closing.FIELD_FEEDBACK] == "Нет"
     assert card.labels[closing.FIELD_ZIP] == "Нет"
-    assert card.fields[closing.FIELD_PAYED] != ""
     assert "Выберите" not in card.labels[closing.FIELD_BSO]
     assert "Выберите" not in card.labels[closing.FIELD_FEEDBACK]
 

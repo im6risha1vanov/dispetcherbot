@@ -43,6 +43,14 @@ SELECT_LABELS = {
     closing.FIELD_FEEDBACK: {"1": "Да", "2": "Нет", "3": "Нет возможности"},
 }
 
+# Yii2 number input: 0 в БД рисуется как value="". Это не промах записи.
+# У селектов пустое — «Выберите...», 0 — «Нет»; их сюда не кладём.
+NUMERIC_DEFAULT_FIELDS = {
+    closing.FIELD_PAYED,
+    closing.FIELD_SPARES,
+    "CustomerRequest[prepayment]",
+}
+
 _IMAGE_UPLOAD_RE = re.compile(
     r"image-upload\?id=(?P<token>[^\"'\\&]+)(?:\\u0026|&amp;|&)target=(?P<target>images_\w+)"
 )
@@ -300,6 +308,27 @@ def _image_target(field: str) -> str:
     return match.group(1) if match else ""
 
 
+def _blank_or_zero(value: str | None) -> bool:
+    """Пустая строка и 0/0.00 для number input Yii — одно и то же."""
+    if value is None:
+        return False
+    raw = str(value).strip().replace("\xa0", "").replace(" ", "").replace(",", ".")
+    if raw == "":
+        return True
+    try:
+        return Decimal(raw) == 0
+    except InvalidOperation:
+        return False
+
+
+def _same_value(name: str, expected: str, actual: str) -> bool:
+    if actual == expected:
+        return True
+    if name in NUMERIC_DEFAULT_FIELDS and _blank_or_zero(expected) and _blank_or_zero(actual):
+        return True
+    return False
+
+
 def _classify_changes(
     before: dict[str, str], after: dict[str, str], intended: dict[str, str]
 ) -> tuple[list[str], list[str]]:
@@ -311,7 +340,7 @@ def _classify_changes(
         new = after.get(name)
         if new is None:
             continue  # поле исчезло из формы — так бывает при смене статуса
-        if new == expected:
+        if _same_value(name, expected, new):
             continue
         msg = f"{name}: было {old!r}, ожидали {expected!r}, стало {new!r}"
         if name in intended:
@@ -322,7 +351,7 @@ def _classify_changes(
         if name in EXTRA_POST_FIELDS or name in before:
             continue
         new = after.get(name)
-        if new != expected:
+        if new is None or not _same_value(name, expected, new):
             unpersisted.append(
                 f"{name}: не было в форме, ожидали {expected!r}, стало {new!r}"
             )

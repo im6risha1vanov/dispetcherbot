@@ -306,6 +306,8 @@ def crm_payload(row) -> dict[str, str]:
         return dict(REMOTE_PAYLOAD)
 
     payload = {
+        # Ноль шлём как "0": без суммы Yii не проводит заявку. HTML GET при этом
+        # часто value="" — сверка в crm._same_value считает пустое и 0 одним.
         FIELD_PAYED: _num(row["payed_by_customer"]),
         # Yii2 number input с 0 рисует value="" (как на закрытых карточках
         # без комплектующих). Шлём пустую строку, иначе сверка ждёт «0».
