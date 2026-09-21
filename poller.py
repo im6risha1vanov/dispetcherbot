@@ -197,6 +197,12 @@ async def dispatch_pending(crm: CrmClient, bot: Bot) -> None:
     pending = await db.requests_awaiting_assignment(
         config.CITY_ID, sorted(config.ASSIGNABLE_STATUSES), config.ASSIGN_LEAD_MIN
     )
+    # SQL уже режет по времени; повторная проверка — чтобы 0 больше не значило «без задержки».
+    pending = [
+        rec
+        for rec in pending
+        if _visit_lead_due(rec["opened_at"], now=now, lead_minutes=config.ASSIGN_LEAD_MIN)
+    ]
     if not pending:
         return
 
@@ -226,13 +232,22 @@ async def _slots(day) -> list[dispatch_queue.ShiftSlot]:
     ]
 
 
+def _visit_lead_due(opened_at, *, now: datetime | None = None, lead_minutes: int) -> bool:
+    """Пора действовать относительно времени визита.
+
+    0 минут — в момент визита, не «сразу как заявка появилась в CRM».
+    Без opened_at ждать нечего — сразу.
+    """
+    if opened_at is None:
+        return True
+    now = now or _today()
+    return opened_at <= now + timedelta(minutes=max(int(lead_minutes), 0))
+
+
 def _alarm_is_due(opened_at, *, now: datetime | None = None, lead_minutes: int | None = None) -> bool:
     """«Нет свободных» бьём за час до визита. Без времени визита — сразу."""
     lead = config.ESCALATE_LEAD_MIN if lead_minutes is None else lead_minutes
-    if lead <= 0 or opened_at is None:
-        return True
-    now = now or _today()
-    return opened_at <= now + timedelta(minutes=lead)
+    return _visit_lead_due(opened_at, now=now, lead_minutes=lead)
 
 
 def _escalation_chats() -> list[str]:
@@ -570,11 +585,12 @@ async def main() -> None:
     bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
     reporting.attach(bot, config.ADMIN_CHAT_ID, "опросе CRM")
     log.info(
-        "опрос каждые %d c, город %d, окно %s–%s, запись в CRM %s",
+        "опрос каждые %d c, город %d, окно %s–%s, раздача за %d мин до визита, запись в CRM %s",
         config.POLL_INTERVAL_SEC,
         config.CITY_ID,
         config.ASSIGN_WINDOW_START,
         config.ASSIGN_WINDOW_END,
+        config.ASSIGN_LEAD_MIN,
         "выключена (read-only)" if config.CRM_READ_ONLY else "ВКЛЮЧЕНА",
     )
 

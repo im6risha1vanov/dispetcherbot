@@ -373,19 +373,11 @@ async def requests_awaiting_assignment(
 ) -> list[asyncpg.Record]:
     """Заявки, которые пора раздать: нужный статус, нет мастера.
 
-    lead_minutes <= 0 — сразу, в том же опросе что уведомление директору.
-    >0 — не раньше чем за N минут до визита (opened_at). Без времени — сразу.
+    Не раньше чем за lead_minutes до визита (opened_at). 0 — в момент визита,
+    не «сразу как строка появилась в CRM». Без времени визита — сразу.
     """
-    time_gate = ""
-    args: list = [city_id, statuses]
-    if lead_minutes > 0:
-        time_gate = (
-            "AND (r.opened_at IS NULL "
-            "OR r.opened_at <= now() + make_interval(mins => $3))"
-        )
-        args.append(lead_minutes)
     return await _pool.fetch(
-        f"""
+        """
         SELECT r.crm_id, r.req_type, r.opened_at, r.status_text, r.is_recall,
                r.customer_name, r.address, r.info_line, r.prior_master_name
         FROM requests r
@@ -393,10 +385,13 @@ async def requests_awaiting_assignment(
         WHERE r.city_id = $1 AND r.is_open AND a.id IS NULL
           AND coalesce(r.master_name, '') = ''
           AND r.status_text = ANY($2::text[])
-          {time_gate}
+          AND (r.opened_at IS NULL
+               OR r.opened_at <= now() + make_interval(mins => $3))
         ORDER BY r.opened_at NULLS FIRST, r.crm_id
         """,
-        *args,
+        city_id,
+        statuses,
+        max(int(lead_minutes), 0),
     )
 
 

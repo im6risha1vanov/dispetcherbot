@@ -161,8 +161,8 @@ def test_заявка_на_вечер_придерживается_если_за
     assert run_db(scenario) == [1001, 1003]
 
 
-def test_при_lead_ноль_вечерняя_заявка_раздаётся_сразу():
-    """ASSIGN_LEAD_MIN=0: в очередь на раздачу в том же опросе, что уведомление."""
+def test_при_lead_ноль_вечерняя_заявка_не_раздаётся():
+    """0 больше не значит «без задержки»: раздача в момент визита, не при появлении."""
     async def scenario():
         later = row(1002)
         later.opened_at = at(6)
@@ -170,7 +170,23 @@ def test_при_lead_ноль_вечерняя_заявка_раздаётся_�
         pending = await db.requests_awaiting_assignment(CITY, ASSIGNABLE, 0)
         return [r["crm_id"] for r in pending]
 
-    assert run_db(scenario) == [1002]
+    assert run_db(scenario) == []
+
+
+def test_заявка_на_завтра_утро_не_уходит_вечером():
+    """Визит в 10:00 — в 19:00 накануне мастеру ещё рано."""
+    async def scenario():
+        now = datetime.now(config.TIMEZONE)
+        tomorrow_ten = (now + timedelta(days=1)).replace(
+            hour=10, minute=0, second=0, microsecond=0
+        )
+        evening_job = row(1010)
+        evening_job.opened_at = tomorrow_ten
+        await db.insert_request(evening_job, CITY, notified=True)
+        pending = await db.requests_awaiting_assignment(CITY, ASSIGNABLE, LEAD)
+        return [r["crm_id"] for r in pending]
+
+    assert run_db(scenario) == []
 
 
 def test_заявка_без_времени_раздаётся_сразу():
