@@ -519,9 +519,22 @@ async def check_accept_timeouts(crm: CrmClient, bot: Bot) -> None:
             )
 
 
+def _payout_card_due(status_text: str | None) -> bool:
+    """Карточку читаем только у проведённой заявки.
+
+    Блок расчёта в CRM есть у «Готов» и «Готов ОФ». Отказ и отмена его не
+    дают, а статус грид обновляет каждый опрос: когда отказ всё-таки проведут,
+    карточка прочитается на том же цикле. Иначе закрытый отказ бьёт CRM
+    каждую минуту вхолостую.
+    """
+    return bool(status_text) and status_text in config.DONE_STATUSES
+
+
 async def send_payouts(crm: CrmClient, bot: Bot) -> None:
     """Заявку закрыл администратор — передаём мастеру расчёт из CRM как есть."""
     for row in await db.assignments_awaiting_payout(config.CITY_ID):
+        if not _payout_card_due(row["status_text"]):
+            continue
         try:
             payout = (await crm.fetch_request_card(row["crm_id"])).payout
         except CrmError:
@@ -574,6 +587,7 @@ async def main() -> None:
         level=config.LOG_LEVEL,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    reporting.quiet_http_client_logs()
     config.validate(config.POLLER_REQUIRED)
 
     stop = asyncio.Event()

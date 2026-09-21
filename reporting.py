@@ -176,6 +176,17 @@ class TelegramErrorHandler(logging.Handler):
             pass  # молча: иначе получим бесконечную цепочку жалоб на жалобы
 
 
+def quiet_http_client_logs() -> None:
+    """httpx на INFO пишет каждый GET. В журнале службы нужны ошибки, не трасса.
+
+    DEBUG оставляем как есть: руками разобрать сессию CRM иначе нечем.
+    """
+    if config.LOG_LEVEL.upper() == "DEBUG":
+        return
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def attach(bot, chat_id: str, source: str) -> None:
     if not chat_id:
         log.warning("чат для сообщений о сбоях не задан — ошибки останутся в журнале")

@@ -529,7 +529,7 @@ async def assignments_awaiting_payout(city_id: int) -> list[asyncpg.Record]:
     """Заявка закрыта администратором, а расчёт мастеру ещё не ушёл."""
     return await _pool.fetch(
         """
-        SELECT a.id, a.crm_id, a.employee_id, m.full_name,
+        SELECT a.id, a.crm_id, a.employee_id, m.full_name, r.status_text,
                coalesce(m.chat_id, m.telegram_id) AS delivery_chat_id
         FROM assignments a
         JOIN requests r USING (crm_id)

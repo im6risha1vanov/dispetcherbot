@@ -505,6 +505,39 @@ def test_открепление_передаёт_message_id_именем():
     assert "business_connection_id" not in kwargs or kwargs.get("business_connection_id") is None
 
 
+def test_штатный_get_httpx_не_пишется_на_info(monkeypatch):
+    import logging
+
+    import reporting
+
+    monkeypatch.setattr(reporting.config, "LOG_LEVEL", "INFO")
+    logger = logging.getLogger("httpx")
+    previous = logger.level
+    logger.setLevel(logging.NOTSET)
+    try:
+        reporting.quiet_http_client_logs()
+        assert logger.level == logging.WARNING
+        assert not logger.isEnabledFor(logging.INFO)
+    finally:
+        logger.setLevel(previous)
+
+
+def test_debug_оставляет_трассу_httpx(monkeypatch):
+    import logging
+
+    import reporting
+
+    monkeypatch.setattr(reporting.config, "LOG_LEVEL", "DEBUG")
+    logger = logging.getLogger("httpx")
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        reporting.quiet_http_client_logs()
+        assert logger.level == logging.INFO
+    finally:
+        logger.setLevel(previous)
+
+
 def test_одинаковые_ошибки_не_спамят_админа():
     """Ошибка повторяется каждую минуту опроса — в чат она должна уйти один раз."""
     import logging

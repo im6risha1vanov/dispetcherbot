@@ -1025,6 +1025,7 @@ async def main() -> None:
         level=config.LOG_LEVEL,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    reporting.quiet_http_client_logs()
     config.validate(config.BOT_REQUIRED)
 
     await db.connect()
