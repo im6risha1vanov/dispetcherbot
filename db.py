@@ -767,31 +767,58 @@ async def set_closure_step(closure_id: int, step: str) -> None:
     await _pool.execute("UPDATE closures SET step = $2 WHERE id = $1", closure_id, step)
 
 
-async def submit_closure(closure_id: int, admin_chat_id: int, admin_message_id: int) -> None:
+async def submit_closure(closure_id: int, copies: list[tuple[int, int]]) -> None:
+    """Отчёт ушёл на подтверждение. copies — все копии как (чат, сообщение).
+
+    Первая копия дублируется в admin_chat_id/admin_message_id: по этим полям
+    отчёт искали до того, как его стали слать сразу администратору и директору.
+    """
+    first_chat, first_message = copies[0] if copies else (None, None)
     await _pool.execute(
         """
         UPDATE closures
         SET state = 'pending_admin', submitted_at = now(),
-            admin_chat_id = $2, admin_message_id = $3
+            admin_chat_id = $2, admin_message_id = $3, decider_messages = $4::jsonb
         WHERE id = $1
         """,
         closure_id,
-        admin_chat_id,
-        admin_message_id,
+        first_chat,
+        first_message,
+        _json_dumps([[str(chat), int(message)] for chat, message in copies]),
     )
 
 
-async def decide_closure(closure_id: int, approved: bool, reason: str = "") -> None:
+async def closure_decider_messages(closure_id: int) -> list[tuple[str, int]]:
+    """Где висит отчёт: чтобы погасить кнопки у того, кто не успел нажать."""
+    row = await _pool.fetchrow(
+        "SELECT decider_messages, admin_chat_id, admin_message_id FROM closures WHERE id = $1",
+        closure_id,
+    )
+    if row is None:
+        return []
+    copies = [(str(chat), int(message)) for chat, message in (row["decider_messages"] or [])]
+    if copies:
+        return copies
+    # Отчёты, отправленные до разделения ролей, знают только одну копию.
+    if row["admin_chat_id"] and row["admin_message_id"]:
+        return [(str(row["admin_chat_id"]), int(row["admin_message_id"]))]
+    return []
+
+
+async def decide_closure(
+    closure_id: int, approved: bool, reason: str = "", decided_by: str = ""
+) -> None:
     await _pool.execute(
         """
         UPDATE closures
-        SET state = $2, decided_at = now(), reject_reason = $3,
+        SET state = $2, decided_at = now(), reject_reason = $3, decided_by = $4,
             step = CASE WHEN $2 = 'rejected' THEN 'payed' ELSE step END
         WHERE id = $1
         """,
         closure_id,
         "approved" if approved else "rejected",
         reason,
+        decided_by,
     )
 
 

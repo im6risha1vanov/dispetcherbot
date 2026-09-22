@@ -14,6 +14,7 @@ import dispatch_queue
 import messages
 import pinning
 import reporting
+import roles
 from crm import CrmClient, CrmError
 
 log = logging.getLogger("poller")
@@ -60,27 +61,29 @@ def format_notification(rec: Mapping[str, Any]) -> str:
 
 
 async def notify_feed(bot: Bot, text: str, *, markup=None) -> None:
-    """Лента заявок: что пришло и кому ушло. Видят наблюдатели, не мастера."""
-    seen = set()
-    for chat in (config.TELEGRAM_TEST_CHAT_ID, config.DIRECTOR_CHAT_ID):
-        if not chat or chat in seen:
-            continue
-        seen.add(chat)
+    """Лента заявок: что пришло и кому ушло. Видят наблюдатели, не мастера.
+
+    Владельцу — только текст: кнопки в его чате всё равно не сработают,
+    решения принимают администратор и директор.
+    """
+    owner = roles.owner_chat()
+    for chat in roles.feed_chats():
         try:
-            await bot.send_message(chat, text, reply_markup=markup)
+            await bot.send_message(
+                chat, text, reply_markup=None if chat == owner else markup
+            )
         except Exception:
             log.exception("не отправил в ленту, чат %s", chat)
 
 
 async def alert(bot: Bot, text: str, *, director: bool = False) -> None:
-    chats = [config.ADMIN_CHAT_ID]
-    if director and config.DIRECTOR_CHAT_ID:
-        chats.append(config.DIRECTOR_CHAT_ID)
-    for chat in chats:
-        try:
-            await bot.send_message(chat, text)
-        except Exception:
-            log.exception("не отправил алерт в чат %s", chat)
+    """Рабочая тревога. Решают администратор и директор, владелец просто знает."""
+    wanted = (await roles.admin_chat(), roles.director_chat() if director else "", roles.owner_chat())
+    chats: list[str] = []
+    for chat in wanted:
+        if chat and chat not in chats:
+            chats.append(chat)
+    await roles.send_to(bot, chats, text)
 
 
 async def seed_baseline(crm: CrmClient) -> None:
@@ -250,13 +253,9 @@ def _alarm_is_due(opened_at, *, now: datetime | None = None, lead_minutes: int |
     return _visit_lead_due(opened_at, now=now, lead_minutes=lead)
 
 
-def _escalation_chats() -> list[str]:
-    """Одно и то же «нет свободных» — директору и администратору."""
-    chats: list[str] = []
-    for chat in (config.DIRECTOR_CHAT_ID, config.ADMIN_CHAT_ID):
-        if chat and chat not in chats:
-            chats.append(chat)
-    return chats
+async def _escalation_chats() -> list[str]:
+    """Одно и то же «нет свободных» — директору, администратору и владельцу."""
+    return await roles.alert_chats()
 
 
 async def _warn_no_masters(bot: Bot, day, pending_count: int) -> None:
@@ -326,8 +325,8 @@ async def _escalate_to_director(crm_bot: Bot, crm: CrmClient, rec, slots) -> Non
         f"Назначьте вручную или дождитесь освобождения."
     )
 
-    chats = _escalation_chats()
-    if not config.ADMIN_CHAT_ID:
+    chats = await _escalation_chats()
+    if not await roles.admin_chat():
         log.warning(
             "ADMIN_CHAT_ID не задан — «нет свободных» по заявке %s уйдёт только директору",
             rec["crm_id"],
@@ -338,10 +337,14 @@ async def _escalate_to_director(crm_bot: Bot, crm: CrmClient, rec, slots) -> Non
             rec["crm_id"],
         )
 
+    # Владельцу — без кнопки «Передать другому»: назначают администратор и директор.
+    owner = roles.owner_chat()
     for chat in chats:
         try:
             await crm_bot.send_message(
-                chat, text, reply_markup=messages.move_keyboard(rec["crm_id"])
+                chat,
+                text,
+                reply_markup=None if chat == owner else messages.move_keyboard(rec["crm_id"]),
             )
         except Exception:
             log.exception("не отправил эскалацию в чат %s", chat)
@@ -597,7 +600,7 @@ async def main() -> None:
     await db.connect()
     crm = CrmClient()
     bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
-    reporting.attach(bot, config.ADMIN_CHAT_ID, "опросе CRM")
+    reporting.attach(bot, roles.owner_chat(), "опросе CRM")
     log.info(
         "опрос каждые %d c, город %d, окно %s–%s, раздача за %d мин до визита, запись в CRM %s",
         config.POLL_INTERVAL_SEC,

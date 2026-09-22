@@ -5,27 +5,41 @@ from datetime import datetime
 
 import config
 import poller
+import roles
 
 
-def test_эскалация_идёт_директору_и_администратору(monkeypatch):
-    monkeypatch.setattr(poller.config, "DIRECTOR_CHAT_ID", "dir")
-    monkeypatch.setattr(poller.config, "ADMIN_CHAT_ID", "adm")
+def _chats(monkeypatch, *, director="", admin="", owner=""):
+    """Роли задаём через конфиг: запомненный чат администратора здесь не нужен."""
+    monkeypatch.setattr(poller.config, "DIRECTOR_CHAT_ID", director)
+    monkeypatch.setattr(poller.config, "ADMIN_CHAT_ID", admin)
+    monkeypatch.setattr(poller.config, "OWNER_CHAT_ID", owner)
+    roles.forget_admin_chat()
+    return asyncio.run(poller._escalation_chats())
 
-    assert poller._escalation_chats() == ["dir", "adm"]
+
+def test_эскалация_идёт_директору_администратору_и_владельцу(monkeypatch):
+    chats = _chats(monkeypatch, director="dir", admin="adm", owner="own")
+
+    assert sorted(chats) == ["adm", "dir", "own"]
 
 
 def test_без_админа_остаётся_директор(monkeypatch):
-    monkeypatch.setattr(poller.config, "DIRECTOR_CHAT_ID", "dir")
-    monkeypatch.setattr(poller.config, "ADMIN_CHAT_ID", "")
+    """Без ADMIN_CHAT_ID владельцем остаётся он же — значит, только директор."""
+    chats = _chats(monkeypatch, director="dir", admin="", owner="")
 
-    assert poller._escalation_chats() == ["dir"]
+    assert chats == ["dir"]
 
 
 def test_одинаковые_чаты_не_дублируются(monkeypatch):
-    monkeypatch.setattr(poller.config, "DIRECTOR_CHAT_ID", "same")
-    monkeypatch.setattr(poller.config, "ADMIN_CHAT_ID", "same")
+    chats = _chats(monkeypatch, director="same", admin="same", owner="same")
 
-    assert poller._escalation_chats() == ["same"]
+    assert chats == ["same"]
+
+
+def test_владелец_получает_тревогу_даже_без_директора(monkeypatch):
+    chats = _chats(monkeypatch, director="", admin="adm", owner="own")
+
+    assert sorted(chats) == ["adm", "own"]
 
 
 def test_тревога_не_сейчас_если_визит_завтра(monkeypatch):

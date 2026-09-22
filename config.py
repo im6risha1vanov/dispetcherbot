@@ -64,6 +64,12 @@ MASTERS_CHAT_ID = _get("MASTERS_CHAT_ID")
 DISPATCHERS_CHAT_ID = _get("DISPATCHERS_CHAT_ID")
 ADMIN_CHAT_ID = _get("ADMIN_CHAT_ID")
 DIRECTOR_CHAT_ID = _get("DIRECTOR_CHAT_ID")
+# Владелец филиала: получает ленту событий и сбои, но ничего не подтверждает.
+# Пусто — владельцем считается ADMIN_CHAT_ID, как было до разделения ролей.
+OWNER_CHAT_ID = _get("OWNER_CHAT_ID")
+# Администратор известен по @username: chat_id бот запомнит сам, когда тот
+# напишет ему первым. Написать человеку по одному лишь @username нельзя.
+ADMIN_USERNAME = _get("ADMIN_USERNAME", "AdmSikBt")
 
 DATABASE_URL = _get("DATABASE_URL")
 
@@ -112,16 +118,22 @@ DONE_STATUSES = _get_set("DONE_STATUSES", "Готов,Готов ОФ")
 _HINTS = {
     "CRM_LOGIN_FIELD_USERNAME": "имя поля логина на /admin/login — снять в инкогнито, п. 9.1 контракта",
     "CRM_LOGIN_FIELD_PASSWORD": "имя поля пароля на /admin/login — снять в инкогнито, п. 9.1 контракта",
-    "TELEGRAM_TEST_CHAT_ID": "id тестового чата — узнать командой /chatid у запущенного bot.py",
+    "TELEGRAM_TEST_CHAT_ID": "прежний чат ленты — заменён на OWNER_CHAT_ID, оставлен для совместимости",
     "TELEGRAM_BOT_TOKEN": "токен от BotFather",
     "CRM_USERNAME": "логин сервисной учётки CRM",
     "CRM_PASSWORD": "пароль сервисной учётки CRM",
     "DATABASE_URL": "строка подключения к PostgreSQL",
     "MASTERS_CHAT_ID": "id общего чата мастеров — туда уходит утренний сбор смены",
     "DISPATCHERS_CHAT_ID": "id чата диспетчеров — туда бот запрашивает номер клиента",
-    "ADMIN_CHAT_ID": "id чата администратора — туда идут алерты",
+    "ADMIN_CHAT_ID": "id чата администратора — туда идут отчёты на подтверждение",
     "DIRECTOR_CHAT_ID": "id чата директора — туда дублируются алерты о просрочке",
+    "OWNER_CHAT_ID": "id чата владельца — туда идёт лента событий и сообщения о сбоях",
 }
+
+# Куда бот пишет людям: хотя бы один чат наблюдателя должен быть задан, иначе
+# лента и сбои уйдут в никуда. Какой именно — дело настройки: владелец,
+# администратор или прежний тестовый чат.
+WATCHER_CHATS = ("OWNER_CHAT_ID", "ADMIN_CHAT_ID", "TELEGRAM_TEST_CHAT_ID")
 
 POLLER_REQUIRED = [
     "CRM_USERNAME",
@@ -129,17 +141,21 @@ POLLER_REQUIRED = [
     "CRM_LOGIN_FIELD_USERNAME",
     "CRM_LOGIN_FIELD_PASSWORD",
     "TELEGRAM_BOT_TOKEN",
-    "TELEGRAM_TEST_CHAT_ID",
     "DATABASE_URL",
     "MASTERS_CHAT_ID",
-    "ADMIN_CHAT_ID",
+    WATCHER_CHATS,
     "DIRECTOR_CHAT_ID",
 ]
-BOT_REQUIRED = ["TELEGRAM_BOT_TOKEN", "DATABASE_URL", "ADMIN_CHAT_ID"]
+BOT_REQUIRED = ["TELEGRAM_BOT_TOKEN", "DATABASE_URL", WATCHER_CHATS]
 
 
-def validate(required: list[str]) -> None:
-    missing = [name for name in required if not globals().get(name)]
+def validate(required: list) -> None:
+    """Кортеж в списке значит «хотя бы один из»: ролям хватает одного чата."""
+    missing: list[str] = []
+    for item in required:
+        names = item if isinstance(item, tuple) else (item,)
+        if not any(globals().get(name) for name in names):
+            missing.extend(names)
     if missing:
         details = "\n".join(f"  {n} — {_HINTS.get(n, 'не заполнен')}" for n in missing)
         raise ConfigError("Не заполнены обязательные параметры в .env:\n" + details)

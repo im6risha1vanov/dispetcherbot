@@ -15,6 +15,7 @@ import db
 import messages
 import pinning
 import reporting
+import roles
 from crm import STATUS_ENROUTE, STATUS_IN_WORK, CrmClient, CrmError
 
 log = logging.getLogger("bot")
@@ -25,10 +26,12 @@ dp = Dispatcher()
 STATUS_BY_STATE = {"enroute": STATUS_ENROUTE, "inwork": STATUS_IN_WORK}
 
 STEP_REPLY = {"enroute": "В пути", "onsite": "На месте", "inwork": "В работе"}
+STEP_ICON = {"enroute": "🚗", "onsite": "📍", "inwork": "🔧"}
 
 
-def _is_admin(message: Message) -> bool:
-    return str(message.chat.id) == config.ADMIN_CHAT_ID
+async def _is_admin(message: Message) -> bool:
+    """Служебные команды: владелец, администратор и директор — все трое."""
+    return await roles.is_supervisor(message.chat.id)
 
 
 async def identify_master(user):
@@ -71,6 +74,59 @@ async def cmd_start(message: Message) -> None:
     )
 
 
+@dp.message.outer_middleware()
+async def catch_admin_chat(handler, event: Message, data):
+    """Запоминает личный чат администратора при первом его сообщении боту.
+
+    Telegram не даёт написать человеку по одному @username: chat_id
+    появляется только после того, как он сам напишет боту. Поэтому ловим
+    первое сообщение и запоминаем чат в базе — насовсем.
+    """
+    chat = getattr(event, "chat", None)
+    user = getattr(event, "from_user", None)
+    if chat is not None and chat.type == "private" and roles.is_admin_username(
+        getattr(user, "username", None)
+    ):
+        try:
+            if await roles.remember_admin_chat(chat.id):
+                await event.answer(
+                    "Вы подключены как администратор.\n"
+                    "Сюда будут приходить отчёты мастеров с кнопками "
+                    "«Подтвердить» и «Отклонить»."
+                )
+                await roles.notify_owner(
+                    event.bot,
+                    f"👤 Администратор @{user.username} подключился — "
+                    "отчёты на подтверждение идут ему и директору.",
+                )
+        except Exception:
+            log.exception("не запомнил чат администратора")
+    return await handler(event, data)
+
+
+@dp.message(Command("roles"))
+async def cmd_roles(message: Message) -> None:
+    """Кто сейчас кто: владелец смотрит, администратор и директор решают."""
+    if not await _is_admin(message):
+        return
+    stored = await roles.admin_chat()
+    if await roles.admin_bound():
+        bound = f"подключён ({stored})"
+    elif stored:
+        bound = f"ещё не писал боту, отчёты идут на {stored} и директору"
+    else:
+        bound = "ещё не писал боту, отчёты идут только директору"
+    owner = roles.owner_chat() or "не задан"
+    director = roles.director_chat() or "не задан"
+    await message.answer(
+        "Роли:\n"
+        f"· Владелец (лента и сбои): {owner}\n"
+        f"· Администратор @{config.ADMIN_USERNAME}: {bound}\n"
+        f"· Директор: {director}\n"
+        "Отчёты на подтверждение уходят администратору и директору."
+    )
+
+
 @dp.message(Command("ping"))
 async def cmd_ping(message: Message) -> None:
     await message.answer("pong")
@@ -83,7 +139,7 @@ async def cmd_chatid(message: Message) -> None:
 
 @dp.message(Command("masters"))
 async def cmd_masters(message: Message) -> None:
-    if not _is_admin(message):
+    if not await _is_admin(message):
         return
     rows = await db.list_masters(config.CITY_ID)
     lines = []
@@ -99,7 +155,7 @@ async def cmd_masters(message: Message) -> None:
 
 @dp.message(Command("master_link"))
 async def cmd_master_link(message: Message, command: CommandObject) -> None:
-    if not _is_admin(message):
+    if not await _is_admin(message):
         return
     parts = (command.args or "").split()
     if len(parts) != 2 or not all(p.lstrip("-").isdigit() for p in parts):
@@ -116,7 +172,7 @@ async def cmd_master_link(message: Message, command: CommandObject) -> None:
 @dp.message(Command("master_user"))
 async def cmd_master_user(message: Message, command: CommandObject) -> None:
     """Прописывает @username заранее: бот привяжется сам, когда мастер напишет /start."""
-    if not _is_admin(message):
+    if not await _is_admin(message):
         return
     parts = (command.args or "").split()
     if len(parts) != 2 or not parts[0].isdigit():
@@ -153,7 +209,7 @@ async def cmd_master_chat(message: Message, command: CommandObject) -> None:
 
 @dp.message(Command("master_off", "master_on"))
 async def cmd_master_toggle(message: Message, command: CommandObject) -> None:
-    if not _is_admin(message):
+    if not await _is_admin(message):
         return
     if not (command.args or "").strip().isdigit():
         await message.answer(f"Формат: /{command.command} <employee_id>")
@@ -187,8 +243,9 @@ async def on_shift(callback: CallbackQuery) -> None:
         await callback.answer(f"Уже отмечены, вы {position}-й в очереди")
 
 
-def _is_supervisor(chat_id: int) -> bool:
-    return str(chat_id) in (config.ADMIN_CHAT_ID, config.DIRECTOR_CHAT_ID)
+async def _is_supervisor(chat_id: int) -> bool:
+    """Решают администратор и директор. Владелец смотрит ленту и не нажимает."""
+    return await roles.is_decider(chat_id)
 
 
 def _director_id() -> str:
@@ -338,7 +395,7 @@ async def _remove_from_master(bot, previous, request, crm_id: int) -> None:
 
 @dp.callback_query(F.data.startswith(f"{messages.CB_MOVE}:"))
 async def on_move_start(callback: CallbackQuery) -> None:
-    if not _is_supervisor(callback.message.chat.id):
+    if not await _is_supervisor(callback.message.chat.id):
         await callback.answer("Передавать заявки может администратор или директор", show_alert=True)
         return
 
@@ -370,7 +427,7 @@ async def on_move_cancel(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith(f"{messages.CB_MOVE_TO}:"))
 async def on_move_to(callback: CallbackQuery, crm: CrmClient) -> None:
-    if not _is_supervisor(callback.message.chat.id):
+    if not await _is_supervisor(callback.message.chat.id):
         await callback.answer("Передавать заявки может администратор или директор", show_alert=True)
         return
 
@@ -416,6 +473,9 @@ async def on_move_to(callback: CallbackQuery, crm: CrmClient) -> None:
         reply_markup=messages.move_keyboard(crm_id),
     )
     await callback.answer(f"Передано: {target['full_name']}")
+    await roles.notify_owner(
+        callback.bot, f"🔄 Заказ {crm_id}: передан вручную мастеру {target['full_name']}"
+    )
     log.info("заявка %s передана вручную мастеру %s", crm_id, target["full_name"])
 
 
@@ -586,27 +646,49 @@ async def _advance_closing(bot, closure_id: int) -> None:
         return
 
     master = await db.master_by_employee(closure["employee_id"])
-    if not config.ADMIN_CHAT_ID:
+    deciders = await roles.deciders()
+    if not deciders:
         await bot.send_message(closure["chat_id"], "Отчёт принят, но чат администратора не настроен.")
+        log.error("заявка %s: отчёт некому подтверждать — нет ни администратора, ни директора",
+                  closure["crm_id"])
         return
 
-    sent = await bot.send_message(
-        config.ADMIN_CHAT_ID,
-        closing.summary(closure, master["full_name"]),
-        reply_markup=messages.admin_decision_keyboard(closure_id),
-    )
-    for kind, file_ids in closing.as_dict(closure["photos"]).items():
-        for file_id in file_ids:
-            try:
-                await bot.send_photo(config.ADMIN_CHAT_ID, file_id, caption=f"{kind} · заказ {closure['crm_id']}")
-            except Exception:
-                log.warning("не переслал фото %s администратору", kind)
+    summary = closing.summary(closure, master["full_name"])
+    photos = closing.as_dict(closure["photos"])
+    copies: list[tuple[int, int]] = []
+    for chat in deciders:
+        try:
+            sent = await bot.send_message(
+                chat, summary, reply_markup=messages.admin_decision_keyboard(closure_id)
+            )
+        except Exception:
+            log.exception("заявка %s: отчёт не ушёл в чат %s", closure["crm_id"], chat)
+            continue
+        copies.append((sent.chat.id, sent.message_id))
+        for kind, file_ids in photos.items():
+            for file_id in file_ids:
+                try:
+                    await bot.send_photo(chat, file_id, caption=f"{kind} · заказ {closure['crm_id']}")
+                except Exception:
+                    log.warning("не переслал фото %s в чат %s", kind, chat)
 
-    await db.submit_closure(closure_id, sent.chat.id, sent.message_id)
-    # У администратора переписка остаётся, у мастера — убирается: фото уже в базе.
+    if not copies:
+        # Ни одна копия не дошла: отчёт остаётся собранным, мастер повторит.
+        await bot.send_message(
+            closure["chat_id"], "Отчёт готов, но проверяющим не дошёл — сообщите администратору."
+        )
+        return
+
+    await db.submit_closure(closure_id, copies)
+    # У проверяющих переписка остаётся, у мастера — убирается: фото уже в базе.
     await _clear_master_chat(bot, closure)
     await bot.send_message(closure["chat_id"], "Отчёт отправлен администратору на проверку.")
-    log.info("заявка %s: отчёт отправлен администратору", closure["crm_id"])
+    await roles.notify_owner(
+        bot,
+        f"📝 Заказ {closure['crm_id']}: {master['full_name']} сдал отчёт, ждёт подтверждения.",
+    )
+    log.info("заявка %s: отчёт отправлен на подтверждение в %d чат(а)",
+             closure["crm_id"], len(copies))
 
 
 async def _clear_master_chat(bot, closure) -> None:
@@ -659,9 +741,31 @@ async def on_closing_rejected(callback: CallbackQuery, crm: CrmClient) -> None:
     await _decide_closing(callback, crm, approved=False)
 
 
+async def _decider_name(callback: CallbackQuery) -> str:
+    """Кто нажал: директор или администратор. Владельцу важно видеть, кто решил."""
+    if _is_director_user(callback.from_user):
+        return "директор"
+    if str(callback.message.chat.id) == await roles.admin_chat():
+        return "администратор"
+    return callback.from_user.full_name or "проверяющий"
+
+
+async def _drop_decision_buttons(bot, closure_id: int, pressed) -> None:
+    """Решил один — у второго кнопки гаснут, чтобы он не нажал следом."""
+    for chat, message_id in await db.closure_decider_messages(closure_id):
+        if pressed is not None and str(chat) == str(pressed.chat.id) and message_id == pressed.message_id:
+            continue
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=chat, message_id=message_id, reply_markup=None
+            )
+        except Exception:
+            log.warning("отчёт %s: не убрал кнопки в чате %s", closure_id, chat)
+
+
 async def _decide_closing(callback: CallbackQuery, crm: CrmClient, *, approved: bool) -> None:
-    if not _is_supervisor(callback.message.chat.id):
-        await callback.answer("Решение принимает администратор", show_alert=True)
+    if not await _is_supervisor(callback.message.chat.id):
+        await callback.answer("Решение принимает администратор или директор", show_alert=True)
         return
 
     closure_id = int(callback.data.split(":", 1)[1])
@@ -670,8 +774,10 @@ async def _decide_closing(callback: CallbackQuery, crm: CrmClient, *, approved: 
         await callback.answer("Отчёт уже обработан", show_alert=True)
         return
 
-    await db.decide_closure(closure_id, approved)
+    who = await _decider_name(callback)
+    await db.decide_closure(closure_id, approved, decided_by=who)
     await callback.message.edit_reply_markup(reply_markup=None)
+    await _drop_decision_buttons(callback.bot, closure_id, callback.message)
 
     if not approved:
         await callback.bot.send_message(
@@ -680,9 +786,16 @@ async def _decide_closing(callback: CallbackQuery, crm: CrmClient, *, approved: 
             "Заполните заново: нажмите «Закрыть заявку» в сообщении заявки.",
         )
         await callback.answer("Отклонено, отчёт вернулся мастеру")
+        await roles.notify_owner(
+            callback.bot,
+            f"↩️ Заказ {closure['crm_id']}: отчёт отклонён ({who}), вернулся мастеру.",
+        )
         return
 
     await callback.answer("Подтверждено")
+    await roles.notify_owner(
+        callback.bot, f"👍 Заказ {closure['crm_id']}: отчёт подтверждён ({who})."
+    )
     await _write_closing(callback.bot, crm, closure)
 
 
@@ -693,8 +806,9 @@ async def _write_closing(bot, crm: CrmClient, closure) -> None:
             "закрытие заявки %s не записано: CRM_ALLOW_CLOSING=false. Поля: %s",
             closure["crm_id"], closing.crm_payload(closure),
         )
-        await bot.send_message(
-            config.ADMIN_CHAT_ID,
+        await roles.send_to(
+            bot,
+            await roles.alert_chats(),
             f"✅ Отчёт по заказу {closure['crm_id']} подтверждён.\n"
             "Запись закрытия в CRM пока выключена — проведите заявку вручную.",
         )
@@ -719,15 +833,26 @@ async def _write_closing(bot, crm: CrmClient, closure) -> None:
             )
     except CrmError:
         log.exception("заявка %s: закрытие не записано в CRM", closure["crm_id"])
-        await bot.send_message(
-            config.ADMIN_CHAT_ID,
+        await roles.send_to(
+            bot,
+            await roles.alert_chats(),
             f"⚠️ Заказ {closure['crm_id']}: CRM не приняла закрытие, проведите вручную.",
         )
         return
 
     await db.mark_closure_written(closure["id"])
     await bot.send_message(closure["chat_id"], f"✅ Заказ {closure['crm_id']} закрыт.")
+    await roles.notify_owner(bot, _written_line(closure))
     log.info("заявка %s: закрытие записано в CRM", closure["crm_id"])
+
+
+def _written_line(closure) -> str:
+    """Что именно ушло в CRM: владелец читает ленту, а не журнал сервера."""
+    if closure["kind"] == closing.KIND_SD_OPEN:
+        return f"🔧 Заказ {closure['crm_id']}: переведён в «В работе СД», записан в CRM."
+    if closure["kind"] == closing.KIND_REMOTE:
+        return f"📞 Заказ {closure['crm_id']}: решён дистанционно, закрыт в CRM."
+    return f"✅ Заказ {closure['crm_id']}: закрыт в CRM."
 
 
 @dp.message(F.photo)
@@ -992,6 +1117,10 @@ async def _advance(callback: CallbackQuery, crm: CrmClient, state: str) -> None:
 
     await callback.answer(STEP_REPLY[state])
     await callback.message.edit_reply_markup(reply_markup=messages.master_keyboard(crm_id, state))
+    await roles.notify_owner(
+        callback.bot,
+        f"{STEP_ICON[state]} Заказ {crm_id}: {master['full_name']} — {STEP_REPLY[state].lower()}",
+    )
 
     # Заявку приняли — напоминание о ней стало мусором в чате.
     if state == "enroute" and assignment["reminder_message_id"]:
@@ -1007,9 +1136,10 @@ async def _advance(callback: CallbackQuery, crm: CrmClient, state: str) -> None:
 
     try:
         damage = await crm.set_status(crm_id, STATUS_BY_STATE[state])
-        if damage and config.ADMIN_CHAT_ID:
-            await callback.bot.send_message(
-                config.ADMIN_CHAT_ID,
+        if damage:
+            await roles.send_to(
+                callback.bot,
+                await roles.alert_chats(),
                 f"‼️ Заказ {crm_id}: смена статуса задела чужие поля в CRM.\n"
                 + "\n".join(damage[:5])
                 + "\nПроверьте карточку руками.",
@@ -1043,7 +1173,7 @@ async def main() -> None:
             return None
 
     crm._download_file = download
-    reporting.attach(bot, config.ADMIN_CHAT_ID, "боте")
+    reporting.attach(bot, roles.owner_chat(), "боте")
     bot._crm_download = download  # СД пишется из своего клиента
 
     try:
