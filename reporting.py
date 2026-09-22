@@ -16,6 +16,7 @@ import re
 import time
 
 import config
+import db
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,105 @@ CRM_NETWORK = (
     "HTTPStatusError",
     "RemoteProtocolError",
 )
+
+TELEGRAM_RIGHTS = (
+    "TelegramForbiddenError",
+    "bot was blocked",
+    "bot was kicked",
+    "not enough rights",
+    "have no rights",
+    "chat not found",
+    "CHAT_WRITE_FORBIDDEN",
+)
+CRM_AUTH = ("CrmAuthError", "редирект на вход", "нет csrf")
+# Запись не прошла: заявку придётся провести руками, сама она не дозапишется.
+CRM_WRITE = (
+    "не записан",
+    "не записано",
+    "не приняла",
+    "не провела",
+    "Проведите вручную",
+    "проведите вручную",
+    "задела чужие поля",
+)
+# Только технические признаки: слово «база» встречается в обычных сообщениях
+# вроде «фото уже в базе» и утащило бы в этот класс что попало.
+DATABASE = (
+    "asyncpg",
+    "Postgres",
+    "pool is closed",
+    "InterfaceError",
+    "ConnectionDoesNotExistError",
+    "connection was closed",
+)
+
+CATEGORIES = (
+    ("права в чате", TELEGRAM_RIGHTS),
+    ("вход в CRM", CRM_AUTH),
+    ("запись в CRM", CRM_WRITE),
+    ("база данных", DATABASE),
+    ("Telegram просит подождать", TELEGRAM_FLOOD),
+    ("Telegram недоступен", TELEGRAM_DOWN),
+    ("связь с Telegram", TELEGRAM_RST),
+    ("связь с CRM", CRM_NETWORK),
+)
+OTHER = "прочее"
+
+# Что делать человеку, который не разработчик. Без этого сводка бесполезна.
+FIXES = {
+    "права в чате": (
+        "Бота выгнали из чата или сняли права. Верните его в чат и дайте "
+        "право удалять и закреплять сообщения — без них заявки не убираются."
+    ),
+    "вход в CRM": (
+        "CRM не пустила бота. Проверьте, не сменили ли пароль служебной "
+        "учётки, и скажите мне — пропишу новый."
+    ),
+    "запись в CRM": (
+        "Откройте заявку в CRM и проведите её руками: бот записать не смог, "
+        "сам он второй раз не попробует."
+    ),
+    "база данных": (
+        "База не ответила. Скажите мне — нужно посмотреть сервер. Пока это "
+        "единичные строки, заявки не теряются."
+    ),
+    "Telegram просит подождать": (
+        "Ничего делать не нужно: Telegram попросил сбавить темп, бот подождал "
+        "и продолжил сам."
+    ),
+    "Telegram недоступен": (
+        "Это на стороне Telegram, не у нас. Само проходит; если к утру не "
+        "прошло — скажите мне."
+    ),
+    "связь с Telegram": (
+        "Ничего делать не нужно: бот переподключается сам. Если таких строк "
+        "больше сотни за сутки — скажите мне, посмотрю сеть сервера."
+    ),
+    "связь с CRM": (
+        "Проверьте, открывается ли bt-lead-centre.ru в браузере. Открывается — "
+        "ничего не делайте, бот повторит сам. Нет — CRM лежит, ждём её."
+    ),
+    OTHER: (
+        "Причина непонятная. Перешлите мне эту строку — разберу по журналу "
+        "сервера."
+    ),
+}
+
+
+def classify(text: str) -> str:
+    """Класс сбоя: по нему в вечерней сводке подбирается совет.
+
+    Порядок важен. Отказ в правах приходит тем же исключением, что и обрыв
+    связи, а «не записано в CRM» — без имени исключения вовсе, одной русской
+    строкой. Поэтому сначала проверяем частное, потом общее.
+    """
+    for name, markers in CATEGORIES:
+        if any(marker in text for marker in markers):
+            return name
+    if "Failed to fetch updates" in text:
+        return "связь с Telegram"
+    return OTHER
+
 
 _CYRILLIC = re.compile(r"[А-Яа-яЁё]")
 _EXCEPTION_NAME = re.compile(
@@ -129,19 +229,45 @@ class TelegramErrorHandler(logging.Handler):
         self._loop = asyncio.get_event_loop()
 
     def emit(self, record: logging.LogRecord) -> None:
+        if self._routine(record):
+            return
+
+        # В чат уходит не всё: повторы схлопываются, поток ограничен. В сводку
+        # пишем каждый случай — иначе вечером не видно, что сбоило весь день.
+        text = record.getMessage()
+        self._loop.create_task(
+            self._remember(
+                classify(text),
+                humanize_for_chat(text),
+                "error" if record.levelno >= logging.ERROR else "warning",
+            )
+        )
+
         message = self._build_alert(record)
         if message is None:
             return
         self._loop.create_task(self._send(message))
 
-    def _build_alert(self, record: logging.LogRecord) -> str | None:
-        # Себя не докладываем: иначе сбой отправки породит новый сбой отправки.
+    @staticmethod
+    def _routine(record: logging.LogRecord) -> bool:
+        """Себя не докладываем, штатные предупреждения библиотек — тоже."""
         if record.name == __name__:
+            return True
+        return any(phrase in record.getMessage() for phrase in ROUTINE)
+
+    async def _remember(self, category: str, summary: str, level: str) -> None:
+        try:
+            await db.record_failure(self._source, category, summary, level)
+        except Exception:
+            # debug, а не warning: иначе жалоба на базу пойдёт через тот же
+            # обработчик и сама попробует записаться в базу.
+            log.debug("сбой не записан для сводки", exc_info=True)
+
+    def _build_alert(self, record: logging.LogRecord) -> str | None:
+        if self._routine(record):
             return None
 
         text = record.getMessage()
-        if any(phrase in text for phrase in ROUTINE):
-            return None
 
         now = time.monotonic()
         if is_transient_telegram(text):

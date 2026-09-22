@@ -872,6 +872,47 @@ async def day_leftovers(day, city_id: int, sd_statuses: list[str]) -> list[async
     )
 
 
+async def record_failure(source: str, category: str, summary: str, level: str) -> None:
+    """Складывает сбой для вечерней сводки — включая тот, о котором промолчали."""
+    await _pool.execute(
+        "INSERT INTO failures (source, category, summary, level) VALUES ($1, $2, $3, $4)",
+        source,
+        category,
+        summary,
+        level,
+    )
+
+
+async def failures_between(start, end) -> list[asyncpg.Record]:
+    """Сбои за период, сгруппированные по причине: в сводке важны счёт и время."""
+    return await _pool.fetch(
+        """
+        SELECT category, summary, source,
+               count(*)                      AS times,
+               max(happened_at)              AS last_at,
+               bool_or(level = 'error')      AS had_error
+        FROM failures
+        WHERE happened_at >= $1 AND happened_at < $2
+        GROUP BY category, summary, source
+        ORDER BY had_error DESC, times DESC, last_at DESC
+        """,
+        start,
+        end,
+    )
+
+
+async def forget_old_failures(keep_days: int) -> int:
+    """Журнал сбоев не должен расти вечно: сводка смотрит только на сутки."""
+    return int(
+        (
+            await _pool.execute(
+                "DELETE FROM failures WHERE happened_at < now() - make_interval(days => $1)",
+                keep_days,
+            )
+        ).split()[-1]
+    )
+
+
 async def get_state(key: str) -> str | None:
     return await _pool.fetchval("SELECT value FROM app_state WHERE key = $1", key)
 

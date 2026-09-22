@@ -288,5 +288,47 @@ def _leftover_blocks(leftovers) -> list[str]:
     return blocks
 
 
+# Совет на случай, если класс сбоя добавили, а что с ним делать — забыли.
+# Пустая строка в сводке хуже честного «не знаю».
+UNKNOWN_FIX = "Причина непонятная. Перешлите мне эту строку — разберу по журналу."
+
+
+def failure_report_text(now, since, rows, fixes) -> str:
+    """Вечерняя сводка сбоев владельцу: что было и что с этим делать.
+
+    Владелец не разработчик, поэтому к каждой причине идёт совет, а не имя
+    исключения. Совсем тихий день — тоже новость: значит всё шло штатно.
+    """
+    period = f"{since.strftime('%d.%m %H:%M')} — {now.strftime('%d.%m %H:%M')}"
+    head = f"🧾 Сводка сбоев за сутки ({period})"
+
+    if not rows:
+        return f"{head}\n\n✅ Всё штатно: сбоев не было."
+
+    total = sum(int(r["times"]) for r in rows)
+    blocks = [head, f"Всего {total}, причин {len(rows)}."]
+    for number, row in enumerate(rows, 1):
+        times = int(row["times"])
+        mark = "🛑" if row["had_error"] else "⚠️"
+        when = row["last_at"].strftime("%H:%M")
+        count = (
+            f"один раз, в {when}"
+            if times == 1
+            else f"{times} {_times_word(times)}, последний в {when}"
+        )
+        blocks.append(
+            f"{number}. {mark} {row['summary']}\n"
+            f"   {count}, в {row['source']}\n"
+            f"   → {fixes.get(row['category'], UNKNOWN_FIX)}"
+        )
+    return "\n\n".join(blocks)
+
+
+def _times_word(count: int) -> str:
+    if count % 10 == 1 and count % 100 != 11:
+        return "раз"
+    return "раза" if 2 <= count % 10 <= 4 and not 12 <= count % 100 <= 14 else "раз"
+
+
 def _money(value) -> str:
     return f"{int(value):,}".replace(",", " ") + " р."

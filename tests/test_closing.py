@@ -538,8 +538,22 @@ def test_debug_оставляет_трассу_httpx(monkeypatch):
         logger.setLevel(previous)
 
 
+def _scheduled(handler):
+    """Какие корутины обработчик поставил в очередь: отправки и записи в сводку."""
+    kinds = []
+    for call in handler._loop.create_task.call_args_list:
+        coro = call.args[0]
+        kinds.append(coro.__name__)
+        coro.close()  # их никто не ждёт: гасим, чтобы не сыпались предупреждения
+    return kinds
+
+
 def test_одинаковые_ошибки_не_спамят_админа():
-    """Ошибка повторяется каждую минуту опроса — в чат она должна уйти один раз."""
+    """Ошибка повторяется каждую минуту опроса — в чат она должна уйти один раз.
+
+    Но в вечернюю сводку должны попасть все пять: иначе не видно, что CRM
+    молчала весь день, а не разок.
+    """
     import logging
 
     handler = _handler()
@@ -547,7 +561,21 @@ def test_одинаковые_ошибки_не_спамят_админа():
     for _ in range(5):
         handler.emit(record)
 
-    assert handler._loop.create_task.call_count == 1
+    kinds = _scheduled(handler)
+    assert kinds.count("_send") == 1
+    assert kinds.count("_remember") == 5
+
+
+def test_штатная_остановка_в_сводку_не_идёт():
+    """SIGTERM при выкладке — не сбой: ни в чат, ни в вечернюю сводку."""
+    import logging
+
+    handler = _handler()
+    handler.emit(
+        logging.LogRecord("aiogram", logging.WARNING, "f", 1, "Received SIGTERM signal", None, None)
+    )
+
+    assert _scheduled(handler) == []
 
 
 def test_сбой_отправки_не_порождает_новый_сбой():

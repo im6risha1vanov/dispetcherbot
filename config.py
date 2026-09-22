@@ -111,6 +111,11 @@ SHIFT_CHECK_TIME = _get_time("SHIFT_CHECK_TIME", "09:00")
 # Через сколько минут после сбора сверять список: мастерам нужно время ответить.
 SHIFT_ROLL_CALL_MIN = _get_int("SHIFT_ROLL_CALL_MIN", 30)
 
+# Вечерняя сводка сбоев владельцу: что ломалось за сутки и что с этим делать.
+# В чат сбои уходят сразу, но повторы схлопываются — сводка показывает всё.
+FAILURE_REPORT_TIME = _get_time("FAILURE_REPORT_TIME", "21:00")
+FAILURE_KEEP_DAYS = _get_int("FAILURE_KEEP_DAYS", 30)
+
 # Итоги дня директору. Закрытыми считаем заявки в этих статусах.
 DIGEST_TIME = _get_time("DIGEST_TIME", "22:00")
 DONE_STATUSES = _get_set("DONE_STATUSES", "Готов,Готов ОФ")

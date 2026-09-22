@@ -119,6 +119,7 @@ async def poll_once(crm: CrmClient, bot: Bot) -> None:
     await check_accept_timeouts(crm, bot)
     await check_onsite_timeouts(bot)
     await send_payouts(crm, bot)
+    await maybe_send_failure_report(bot)
     await maybe_send_digest(bot)
 
 
@@ -174,6 +175,35 @@ async def check_shift_roll_call(bot: Bot) -> None:
 
     await db.set_state(key, now.isoformat())
     log.info("сверка смены: не отметились %d", len(missing))
+
+
+FAILURE_REPORT_SINCE = "failure_report_since"
+
+
+async def maybe_send_failure_report(bot: Bot) -> None:
+    """Вечерняя сводка сбоев владельцу: что ломалось за сутки и что с этим делать.
+
+    Период считаем от прошлой сводки, а не от полуночи: иначе сбои между
+    21:00 и полуночью не попали бы ни в одну.
+    """
+    now = _today()
+    if now.time() < config.FAILURE_REPORT_TIME:
+        return
+    key = f"failure_report:{config.CITY_ID}:{now.date().isoformat()}"
+    if await db.get_state(key):
+        return
+
+    previous = await db.get_state(FAILURE_REPORT_SINCE)
+    since = datetime.fromisoformat(previous) if previous else now - timedelta(days=1)
+    rows = await db.failures_between(since, now)
+    await roles.notify_owner(
+        bot, messages.failure_report_text(now, since, rows, reporting.FIXES)
+    )
+
+    await db.set_state(key, now.isoformat())
+    await db.set_state(FAILURE_REPORT_SINCE, now.isoformat())
+    await db.forget_old_failures(config.FAILURE_KEEP_DAYS)
+    log.info("сводка сбоев за сутки отправлена: причин %d", len(rows))
 
 
 async def maybe_send_digest(bot: Bot) -> None:
