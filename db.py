@@ -46,8 +46,13 @@ async def connect() -> None:
 
 
 async def close() -> None:
-    if _pool is not None:
-        await _pool.close()
+    global _pool
+    if _pool is None:
+        return
+    await _pool.close()
+    # Забываем закрытый пул: иначе следующая попытка взять из него соединение
+    # падает с «pool is closed» вместо честного «база не подключена».
+    _pool = None
 
 
 async def insert_request(row, city_id: int, *, notified: bool, is_open: bool = True) -> bool:
@@ -569,7 +574,7 @@ class request_lock:
         self._conn = None
 
     async def __aenter__(self):
-        if _pool is None:
+        if _pool is None or _pool.is_closing():
             return self  # разовые скрипты и тесты работают без базы
         self._conn = await _pool.acquire()
         await self._conn.execute("SELECT pg_advisory_lock($1)", self._crm_id)
