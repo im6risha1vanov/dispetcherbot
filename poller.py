@@ -12,6 +12,7 @@ import config
 import db
 import dispatch_queue
 import messages
+import photos
 import pinning
 import reporting
 import roles
@@ -203,6 +204,9 @@ async def maybe_send_failure_report(bot: Bot) -> None:
     await db.set_state(key, now.isoformat())
     await db.set_state(FAILURE_REPORT_SINCE, now.isoformat())
     await db.forget_old_failures(config.FAILURE_KEEP_DAYS)
+    dropped = photos.forget_old(config.PHOTO_KEEP_DAYS)
+    if dropped:
+        log.info("убрано снимков отчётов: %d", dropped)
     log.info("сводка сбоев за сутки отправлена: причин %d", len(rows))
 
 

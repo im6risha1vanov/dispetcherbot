@@ -6,12 +6,14 @@
 """
 
 import asyncio
+import io
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import closing
 import config
 import messages
+import photos
 from crm import CrmError
 
 KIM = 10679
@@ -220,14 +222,20 @@ def _photo_message(store, closure_id, file_id):
     message.message_id = 800 + len(store.rows[closure_id]["photos"].get("bso", []))
     message.reply_to_message = None
     message.bot = _tg()
+    # Снимок бот забирает из Telegram сразу же, а не перед записью в CRM.
+    message.bot.get_file = AsyncMock(return_value=MagicMock(file_path="tg/path.jpg"))
+    message.bot.download_file = AsyncMock(
+        return_value=io.BytesIO(f"снимок {file_id}".encode())
+    )
     return message
 
 
 class Run:
     """Один прогон анкеты: хранилище живёт дольше любого «процесса»."""
 
-    def __init__(self, monkeypatch, kind=closing.KIND_CLOSE):
+    def __init__(self, monkeypatch, tmp_path, kind=closing.KIND_CLOSE):
         self.bot = _bot(monkeypatch)
+        monkeypatch.setattr(config, "PHOTO_DIR", str(tmp_path / "photos"))
         self.store = Store()
         self.stack = []
         self.store.install(self.bot, self.stack)
@@ -284,70 +292,64 @@ def _walk_to_summary(run, *, with_zip: bool):
         await run.ask_first()
         await run.photo("bso-1")
         await run.photo("bso-2")
-        await run.press_done()          # docs_photo -> zip
-        await run.choose("1" if with_zip else "0")
+        await run.press_done()              # docs_photo -> prepay
+        await run.answer("1000")            # предоплата
+        await run.answer("3500")            # сумма заявки, уже с предоплатой
+        await run.answer("500" if with_zip else "0")   # стоимость ЗПЧ
         if with_zip:
             await run.photo("zip-1")
-            await run.press_done()      # zip_photo -> receipt
-        await run.choose("0")           # режим чека: без чека
-        await run.answer("0")           # предоплата
-        await run.answer("3500")        # сумма заявки
-        if with_zip:
-            await run.answer("500")     # сумма ЗПЧ
-        await run.choose("2")           # отзыв: нет
+            await run.press_done()          # zip_photo -> feedback
+        await run.choose("2")               # отзыв: нет
 
     asyncio.run(scenario())
 
 
-def test_ветка_без_зпч_доходит_до_сводки(monkeypatch):
-    run = Run(monkeypatch)
+def test_ветка_без_зпч_доходит_до_сводки(monkeypatch, tmp_path):
+    run = Run(monkeypatch, tmp_path)
     try:
         _walk_to_summary(run, with_zip=False)
         row = run.store.rows[run.id]
 
         assert row["state"] == "pending_admin"
         assert row["payed_by_customer"] == Decimal("3500")
-        assert row["prepayment_sum"] == Decimal("0")
-        assert row["with_zip"] == "0"
-        assert row["receipt_mode"] == "0"
-        assert row["spares_cost"] is None
-        assert row["photos"]["bso"] == ["bso-1", "bso-2"]
+        assert row["prepayment_sum"] == Decimal("1000")
+        assert row["spares_cost"] == Decimal("0")
+        assert len(row["photos"]["bso"]) == 2
     finally:
         run.close()
 
 
-def test_ветка_с_зпч_спрашивает_фото_и_сумму(monkeypatch):
-    run = Run(monkeypatch)
+def test_ветка_с_зпч_спрашивает_фото_и_сумму(monkeypatch, tmp_path):
+    run = Run(monkeypatch, tmp_path)
     try:
         _walk_to_summary(run, with_zip=True)
         row = run.store.rows[run.id]
 
         assert row["state"] == "pending_admin"
-        assert row["with_zip"] == "1"
         assert row["spares_cost"] == Decimal("500")
-        assert row["photos"]["spare"] == ["zip-1"]
+        assert len(row["photos"]["spare"]) == 1
+        assert closing.crm_payload(row)[closing.FIELD_ZIP] == "1"
     finally:
         run.close()
 
 
-def test_анкету_можно_прервать_на_любом_шаге(monkeypatch):
+def test_анкету_можно_прервать_на_любом_шаге(monkeypatch, tmp_path):
     """Перезапуск службы: обработчики новые, строка та же — шаг не теряется."""
-    run = Run(monkeypatch)
+    run = Run(monkeypatch, tmp_path)
     try:
         async def part_one():
             await run.ask_first()
             await run.photo("bso-1")
             await run.press_done()
-            await run.choose("0")
+            await run.answer("1000")
 
         asyncio.run(part_one())
-        assert run.step() == "receipt"
+        assert run.step() == "total"
 
         # «Процесс перезапустился»: всё, что знает бот, он читает из строки.
         async def part_two():
-            await run.choose("0")
-            await run.answer("1000")
             await run.answer("4000")
+            await run.answer("0")
             await run.choose("2")
 
         asyncio.run(part_two())
@@ -360,8 +362,8 @@ def test_анкету_можно_прервать_на_любом_шаге(monke
         run.close()
 
 
-def test_фото_мастера_удаляется_сразу(monkeypatch):
-    run = Run(monkeypatch)
+def test_фото_мастера_удаляется_сразу(monkeypatch, tmp_path):
+    run = Run(monkeypatch, tmp_path)
     try:
         dropped = []
 
@@ -378,20 +380,23 @@ def test_фото_мастера_удаляется_сразу(monkeypatch):
             message_id = asyncio.run(scenario())
 
         assert dropped == [message_id], "снимок должен исчезать из чата мастера"
-        assert run.store.rows[run.id]["photos"]["bso"] == ["bso-1"]
+
+        saved = run.store.rows[run.id]["photos"]["bso"]
+        assert len(saved) == 1
+        assert photos.read(saved[0]) == "снимок bso-1".encode(), (
+            "файл должен лежать на диске, а не только ссылкой в Telegram"
+        )
     finally:
         run.close()
 
 
-def test_мусор_вместо_суммы_не_проходит_молча(monkeypatch):
-    run = Run(monkeypatch)
+def test_мусор_вместо_суммы_не_проходит_молча(monkeypatch, tmp_path):
+    run = Run(monkeypatch, tmp_path)
     try:
         async def scenario():
             await run.ask_first()
             await run.photo("bso-1")
             await run.press_done()
-            await run.choose("0")
-            await run.choose("0")
             message = await run.answer("где-то три тыщи")
             return message
 
@@ -407,9 +412,9 @@ def test_мусор_вместо_суммы_не_проходит_молча(mon
         run.close()
 
 
-def test_отказ_сбрасывает_отчёт_целиком(monkeypatch):
+def test_отказ_сбрасывает_отчёт_целиком(monkeypatch, tmp_path):
     """Прежние фото не должны уехать в CRM вместе с исправленными."""
-    run = Run(monkeypatch)
+    run = Run(monkeypatch, tmp_path)
     try:
         _walk_to_summary(run, with_zip=False)
         old_id = run.id
@@ -446,8 +451,8 @@ def _approve(run, crm):
     return callback
 
 
-def test_повторное_провести_не_проводит_дважды(monkeypatch):
-    run = Run(monkeypatch)
+def test_повторное_провести_не_проводит_дважды(monkeypatch, tmp_path):
+    run = Run(monkeypatch, tmp_path)
     try:
         _walk_to_summary(run, with_zip=False)
         crm = AsyncMock()
@@ -467,8 +472,8 @@ def test_повторное_провести_не_проводит_дважды(
         run.close()
 
 
-def test_падение_crm_сохраняет_отчёт_и_даёт_повтор(monkeypatch):
-    run = Run(monkeypatch)
+def test_падение_crm_сохраняет_отчёт_и_даёт_повтор(monkeypatch, tmp_path):
+    run = Run(monkeypatch, tmp_path)
     try:
         _walk_to_summary(run, with_zip=False)
         crm = AsyncMock()
@@ -504,8 +509,8 @@ def test_падение_crm_сохраняет_отчёт_и_даёт_повто
         run.close()
 
 
-def test_повтор_после_сбоя_проводит_заявку(monkeypatch):
-    run = Run(monkeypatch)
+def test_повтор_после_сбоя_проводит_заявку(monkeypatch, tmp_path):
+    run = Run(monkeypatch, tmp_path)
     try:
         _walk_to_summary(run, with_zip=False)
         crm = AsyncMock()
@@ -531,8 +536,8 @@ def test_повтор_после_сбоя_проводит_заявку(monkeypa
         run.close()
 
 
-def test_повтор_по_проведённой_заявке_не_срабатывает(monkeypatch):
-    run = Run(monkeypatch)
+def test_повтор_по_проведённой_заявке_не_срабатывает(monkeypatch, tmp_path):
+    run = Run(monkeypatch, tmp_path)
     try:
         _walk_to_summary(run, with_zip=False)
         crm = AsyncMock()
@@ -553,8 +558,8 @@ def test_повтор_по_проведённой_заявке_не_срабат
         run.close()
 
 
-def test_владелец_не_проводит_заявку(monkeypatch):
-    run = Run(monkeypatch)
+def test_владелец_не_проводит_заявку(monkeypatch, tmp_path):
+    run = Run(monkeypatch, tmp_path)
     try:
         _walk_to_summary(run, with_zip=False)
         crm = AsyncMock()

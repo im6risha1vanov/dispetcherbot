@@ -12,6 +12,7 @@ import closing
 import config
 import db
 import messages
+import photos
 import pinning
 import reporting
 import roles
@@ -955,9 +956,14 @@ async def on_closing_photo(message: Message) -> None:
     if step is None or step.kind != "photo":
         return
 
-    accepted = await db.add_closure_photo(
-        closure["id"], step.photo_kind, message.photo[-1].file_id
-    )
+    stored = await _keep_photo(message, message.photo[-1].file_id)
+    if stored is None:
+        await message.reply(
+            "⚠️ Не смог забрать это фото. Пришлите его ещё раз."
+        )
+        return
+
+    accepted = await db.add_closure_photo(closure["id"], step.photo_kind, stored)
     await pinning.drop_message(message.bot, message.chat.id, message.message_id)
 
     if step.multi:
@@ -966,6 +972,22 @@ async def on_closing_photo(message: Message) -> None:
         return
 
     await _advance_closing(message.bot, closure["id"])
+
+
+async def _keep_photo(message: Message, file_id: str) -> str | None:
+    """Скачивает снимок и кладёт на диск. Возвращает имя файла для базы.
+
+    Качаем сразу, а не перед записью в CRM: между этими моментами лежит
+    проверка администратора, и всё это время документ существовал бы
+    только у Telegram.
+    """
+    try:
+        info = await message.bot.get_file(file_id)
+        buffer = await message.bot.download_file(info.file_path)
+        return photos.save(buffer.read())
+    except Exception:
+        log.exception("не сохранил снимок мастера")
+        return None
 
 
 async def _show_photo_count(bot, closure, step, accepted: int) -> None:
@@ -1300,14 +1322,21 @@ async def main() -> None:
     crm = CrmClient()
     bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
 
-    async def download(file_id: str) -> bytes | None:
-        """Фото отчёта живут в Telegram — забираем их перед загрузкой в CRM."""
+    async def download(name: str) -> bytes | None:
+        """Снимок для загрузки в CRM: с диска, а при нужде — из Telegram.
+
+        Отчёты, начатые до перехода на файлы, помнят только ссылку
+        Telegram — их дочитываем по-старому, чтобы не потерять.
+        """
+        content = photos.read(name)
+        if content is not None:
+            return content
         try:
-            info = await bot.get_file(file_id)
+            info = await bot.get_file(name)
             buffer = await bot.download_file(info.file_path)
             return buffer.read()
         except Exception:
-            log.exception("не скачал файл %s из Telegram", file_id)
+            log.exception("не достал снимок %s ни с диска, ни из Telegram", name)
             return None
 
     crm._download_file = download

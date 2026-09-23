@@ -331,7 +331,7 @@ def test_директор_кладёт_фото_в_окно_crm(monkeypatch):
              patch.object(
                  bot.db, "collecting_closures_in_chat", AsyncMock(return_value=[photo_closure])
              ), \
-             patch.object(bot.db, "add_closure_photo", AsyncMock()) as added, \
+             patch.object(bot, "_keep_photo", AsyncMock(return_value="tgfile-bso")),              patch.object(bot.db, "add_closure_photo", AsyncMock(return_value=1)) as added, \
              patch.object(bot.db, "remember_closure_message", AsyncMock()):
             await bot.on_closing_photo(message)
             return added.await_args.args

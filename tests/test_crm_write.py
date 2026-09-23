@@ -834,12 +834,12 @@ def _conducted_card() -> str:
     )
 
 
-def test_отчёт_кладёт_предоплату_режим_чека_и_зпч(monkeypatch):
+def test_отчёт_кладёт_суммы_и_зпч(monkeypatch):
     """Состав обоих запросов: save_close в первом, finish=1 во втором."""
     monkeypatch.setattr(config, "CRM_READ_ONLY", False)
     monkeypatch.setattr(config, "CRM_WRITE_ONLY_FOR", frozenset())
     crm = FakeCrm(card=CLOSE_CARD)
-    saved = _saved_close_card(payed="3500", prepay="1000", zip="1", receipt="10", fback="2")
+    saved = _saved_close_card(payed="3500", zip="0", fback="2")
     crm.card_after = saved
     crm.card_finish = saved.replace(
         """<select name="CustomerRequest[status]">
@@ -855,8 +855,6 @@ def test_отчёт_кладёт_предоплату_режим_чека_и_з�
         "prepayment_sum": 1000,
         "spares_cost": 0,
         "with_bso": None,
-        "with_zip": "1",
-        "receipt_mode": "10",
         "fback_mode": "2",
         "photos": {closing.PHOTO_BSO: ["tgfile1"]},
     }
@@ -879,10 +877,12 @@ def test_отчёт_кладёт_предоплату_режим_чека_и_з�
     assert "finish=1" not in crm.write_urls[0]
     assert "finish=1" in crm.write_urls[1]
 
-    assert first[closing.FIELD_PAYED] == "3500"
-    assert first[closing.FIELD_PREPAY] == "1000"
-    assert first[closing.FIELD_ZIP] == "1"
-    assert first[closing.FIELD_RECEIPT] == "10"
+    assert first[closing.FIELD_PAYED] == "3500", "сумма итоговая, с предоплатой внутри"
+    # Форма уходит целиком, поэтому поле предоплаты в теле есть — но ровно
+    # таким, каким было на карточке: бот его не заполняет.
+    assert first[closing.FIELD_PREPAY_UNUSED] == ""
+    assert closing.FIELD_PREPAY_UNUSED not in closing.crm_payload(row)
+    assert first[closing.FIELD_RECEIPT] == closing.RECEIPT_NONE
     assert first[closing.FIELD_BSO] == "1", "фото документов означают «БСО есть»"
     assert first[closing.FIELD_REQ_FBACK] == "1"
 
