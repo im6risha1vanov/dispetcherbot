@@ -13,6 +13,9 @@ def _chats(monkeypatch, *, director="", admin="", owner=""):
     monkeypatch.setattr(poller.config, "DIRECTOR_CHAT_ID", director)
     monkeypatch.setattr(poller.config, "ADMIN_CHAT_ID", admin)
     monkeypatch.setattr(poller.config, "OWNER_CHAT_ID", owner)
+    # Прежний чат ленты подставляется владельцем, если тот не задан:
+    # на сервере он заполнен и подменил бы ожидаемый список.
+    monkeypatch.setattr(poller.config, "TELEGRAM_TEST_CHAT_ID", "")
     roles.forget_admin_chat()
     return asyncio.run(poller._escalation_chats())
 

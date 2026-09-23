@@ -383,9 +383,12 @@ def test_закрытие_за_директора_rmw_мастера_и_finish(m
         "kind": closing.KIND_CLOSE,
         "payed_by_customer": 1500,
         "spares_cost": 0,
-        "with_bso": "1",
+        "with_bso": None,
         "fback_mode": "3",
+        # Те же снимки, что уходят в CRM: из них и выводится «БСО есть».
+        "photos": {closing.PHOTO_BSO: ["tgfile1"]},
     })
+    assert payload[closing.FIELD_BSO] == "1"
     assert FIELD_EMPLOYEE not in payload
 
     async def scenario(c):
