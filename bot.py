@@ -2,7 +2,6 @@ import asyncio
 import logging
 import re
 from datetime import datetime
-from decimal import Decimal
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -634,7 +633,16 @@ async def _ask_closing_step(bot, closure, step_key: str) -> None:
         messages.closing_question(step, closure["crm_id"]),
         reply_markup=messages.closing_keyboard(step),
     )
-    await db.remember_closure_message(closure["id"], sent.message_id)
+    await db.remember_closure_message(closure["id"], sent.message_id, question=True)
+
+
+async def _tell_supervisors(bot, text: str, *, markup=None) -> None:
+    """Проверяющим — с кнопкой, владельцу — только текст: решает не он."""
+    chats = await roles.deciders()
+    await roles.send_to(bot, chats, text, markup=markup)
+    owner = roles.owner_chat()
+    if owner and owner not in chats:
+        await roles.notify_owner(bot, text)
 
 
 async def _advance_closing(bot, closure_id: int) -> None:
@@ -775,23 +783,15 @@ async def _decide_closing(callback: CallbackQuery, crm: CrmClient, *, approved: 
         return
 
     who = await _decider_name(callback)
-    await db.decide_closure(closure_id, approved, decided_by=who)
     await callback.message.edit_reply_markup(reply_markup=None)
     await _drop_decision_buttons(callback.bot, closure_id, callback.message)
 
     if not approved:
-        await callback.bot.send_message(
-            closure["chat_id"],
-            f"❌ Отчёт по заказу {closure['crm_id']} отклонён администратором.\n"
-            "Заполните заново: нажмите «Закрыть заявку» в сообщении заявки.",
-        )
-        await callback.answer("Отклонено, отчёт вернулся мастеру")
-        await roles.notify_owner(
-            callback.bot,
-            f"↩️ Заказ {closure['crm_id']}: отчёт отклонён ({who}), вернулся мастеру.",
-        )
+        await _restart_report(callback, closure, who)
         return
 
+    # Состояние меняем до записи: второе нажатие уже не найдёт pending_admin.
+    await db.decide_closure(closure_id, True, decided_by=who)
     await callback.answer("Подтверждено")
     await roles.notify_owner(
         callback.bot, f"👍 Заказ {closure['crm_id']}: отчёт подтверждён ({who})."
@@ -799,16 +799,80 @@ async def _decide_closing(callback: CallbackQuery, crm: CrmClient, *, approved: 
     await _write_closing(callback.bot, crm, closure)
 
 
+async def _restart_report(callback: CallbackQuery, closure, who: str) -> None:
+    """Отклонённый отчёт сбрасывается целиком: мастер проходит анкету с нуля.
+
+    Прежние снимки остаются в базе историей, но в новый отчёт не попадают —
+    иначе забракованное фото уехало бы в CRM вместе с исправленным.
+    """
+    await db.discard_closure(closure["id"], f"отклонил {who}")
+    await callback.answer("Отклонено, отчёт вернулся мастеру")
+    await roles.notify_owner(
+        callback.bot,
+        f"↩️ Заказ {closure['crm_id']}: отчёт отклонён ({who}), мастер заполняет заново.",
+    )
+
+    first = closing.FIRST_STEP_BY_KIND.get(closure["kind"])
+    if first is None:
+        # Дистанционное решение вопросов не задаёт — заново нажимать кнопку.
+        await callback.bot.send_message(
+            closure["chat_id"],
+            f"❌ Отчёт по заказу {closure['crm_id']} отклонён. "
+            "Нажмите кнопку в сообщении заявки ещё раз.",
+        )
+        return
+
+    fresh = await db.open_closure(
+        closure["crm_id"], closure["employee_id"], closure["chat_id"], closure["kind"]
+    )
+    if fresh is None:
+        log.error("заявка %s: не завёл новый отчёт после отказа", closure["crm_id"])
+        await callback.bot.send_message(
+            closure["chat_id"],
+            f"❌ Отчёт по заказу {closure['crm_id']} отклонён. "
+            "Нажмите «Отчёт» в сообщении заявки ещё раз.",
+        )
+        return
+
+    await callback.bot.send_message(
+        closure["chat_id"],
+        f"❌ Отчёт по заказу {closure['crm_id']} отклонён.\n"
+        "Заполняем заново — отвечайте на вопросы ниже. Прежние фото не в счёт.",
+    )
+    await _ask_closing_step(callback.bot, fresh, first)
+    log.info("заявка %s: отчёт отклонён (%s), мастер начинает заново", closure["crm_id"], who)
+
+
+@dp.callback_query(F.data.startswith(f"{messages.CB_CLOSE_RETRY}:"))
+async def on_conduct_retry(callback: CallbackQuery, crm: CrmClient) -> None:
+    """CRM не приняла закрытие — отчёт цел, нужна только новая попытка."""
+    if not await _is_supervisor(callback.message.chat.id):
+        await callback.answer("Повторить может администратор или директор", show_alert=True)
+        return
+
+    closure_id = int(callback.data.split(":", 1)[1])
+    closure = await db.closure_awaiting_conduct(closure_id)
+    if closure is None:
+        await callback.answer("Заявка уже проведена или отчёт отменён", show_alert=True)
+        return
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer("Пробую ещё раз")
+    await _write_closing(callback.bot, crm, closure)
+
+
 async def _write_closing(bot, crm: CrmClient, closure) -> None:
-    """Запись закрытия в CRM. Пока выключена — проводит администратор руками."""
+    """Запись закрытия в CRM и проведение заявки."""
     if not config.CRM_ALLOW_CLOSING:
         log.warning(
             "закрытие заявки %s не записано: CRM_ALLOW_CLOSING=false. Поля: %s",
             closure["crm_id"], closing.crm_payload(closure),
         )
-        await roles.send_to(
+        await _tell_supervisors(
             bot,
-            await roles.alert_chats(),
             f"✅ Отчёт по заказу {closure['crm_id']} подтверждён.\n"
             "Запись закрытия в CRM пока выключена — проведите заявку вручную.",
         )
@@ -831,19 +895,36 @@ async def _write_closing(bot, crm: CrmClient, closure) -> None:
             await crm.close_request(
                 closure["crm_id"], closing.crm_payload(closure), closure["photos"]
             )
-    except CrmError:
-        log.exception("заявка %s: закрытие не записано в CRM", closure["crm_id"])
-        await roles.send_to(
-            bot,
-            await roles.alert_chats(),
-            f"⚠️ Заказ {closure['crm_id']}: CRM не приняла закрытие, проведите вручную.",
-        )
+    except CrmError as failure:
+        await _conduct_failed(bot, closure, failure)
         return
 
     await db.mark_closure_written(closure["id"])
     await bot.send_message(closure["chat_id"], f"✅ Заказ {closure['crm_id']} закрыт.")
     await roles.notify_owner(bot, _written_line(closure))
     log.info("заявка %s: закрытие записано в CRM", closure["crm_id"])
+
+
+async def _conduct_failed(bot, closure, failure: Exception) -> None:
+    """CRM отказала. Отчёт остаётся целым — мастеру нечего заполнять заново.
+
+    Проверяющие получают текст отказа и кнопку повтора: без причины человек
+    не знает, чинить ему карточку или просто нажать ещё раз.
+    """
+    log.exception("заявка %s: закрытие не записано в CRM", closure["crm_id"])
+    attempts = await db.note_conduct_attempt(closure["id"], str(failure))
+    await _tell_supervisors(
+        bot,
+        f"⚠️ Заказ {closure['crm_id']}: CRM не приняла закрытие "
+        f"(попытка {attempts}).\n\n{failure}\n\n"
+        "Отчёт цел. Нажмите «Повторить проведение» или проведите заявку вручную.",
+        markup=messages.retry_conduct_keyboard(closure["id"]),
+    )
+    await bot.send_message(
+        closure["chat_id"],
+        f"⏳ Заказ {closure['crm_id']}: отчёт принят, но CRM пока не провела заявку.\n"
+        "Администратор уже знает. Заполнять заново не нужно.",
+    )
 
 
 def _written_line(closure) -> str:
@@ -857,7 +938,11 @@ def _written_line(closure) -> str:
 
 @dp.message(F.photo)
 async def on_closing_photo(message: Message) -> None:
-    """Фото во время отчёта ложится в то окно CRM, о котором был вопрос."""
+    """Фото во время отчёта ложится в то окно CRM, о котором был вопрос.
+
+    Снимок мастера удаляется сразу, как только попал в базу: чат мастера
+    читают с телефона на объекте, и десяток картинок мешает найти заявку.
+    """
     master = await identify_master(message.from_user)
     director = _director_closing(message.from_user, message.chat.id)
     closure = await _message_closure(
@@ -870,18 +955,36 @@ async def on_closing_photo(message: Message) -> None:
     if step is None or step.kind != "photo":
         return
 
-    await db.add_closure_photo(closure["id"], step.photo_kind, message.photo[-1].file_id)
-    await db.remember_closure_message(closure["id"], message.message_id)
+    accepted = await db.add_closure_photo(
+        closure["id"], step.photo_kind, message.photo[-1].file_id
+    )
+    await pinning.drop_message(message.bot, message.chat.id, message.message_id)
 
     if step.multi:
         # Ждём остальные снимки: мастер закончит кнопкой «Готово».
-        reply = await message.reply("Принято. Пришлите ещё или нажмите «Готово».")
-        await db.remember_closure_message(closure["id"], reply.message_id)
+        await _show_photo_count(message.bot, closure, step, accepted)
         return
 
-    reply = await message.reply("Принято")
-    await db.remember_closure_message(closure["id"], reply.message_id)
     await _advance_closing(message.bot, closure["id"])
+
+
+async def _show_photo_count(bot, closure, step, accepted: int) -> None:
+    """Счётчик принятых снимков дописывается прямо в вопрос.
+
+    Мастер видит, что фото дошли, а новых сообщений в чате не появляется.
+    """
+    message_id = closure["question_message_id"]
+    if not message_id:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=closure["chat_id"],
+            message_id=message_id,
+            text=messages.closing_question(step, closure["crm_id"], accepted),
+            reply_markup=messages.closing_keyboard(step),
+        )
+    except Exception:
+        log.debug("счётчик снимков не обновился", exc_info=True)
 
 
 SD_MENTION_RE = re.compile(r"@\w*bot\b.*?(\d{5,})", re.IGNORECASE | re.DOTALL)
@@ -1000,55 +1103,68 @@ def _closing_step(closure):
     key = closing.canonical_step(closure["kind"], closure["step"])
     return closing.STEPS_BY_KIND[closure["kind"]].get(key)
 
-@dp.message(F.text.regexp(r"^\s*\d+([.,]\d+)?\s*$"))
-async def on_closing_amount(message: Message) -> None:
+@dp.message(F.text)
+async def on_closing_answer(message: Message) -> None:
+    """Текстовый ответ мастера: сумма или свободный комментарий.
+
+    Чужой текст пропускаем дальше по цепочке: тем же сообщением диспетчер
+    отвечает мастеру, и проглотить его здесь нельзя.
+    """
     master = await identify_master(message.from_user)
     director = _director_closing(message.from_user, message.chat.id)
     closure = await _message_closure(message, master, is_director=director)
     if closure is None or closure["state"] != "collecting":
-        return
+        raise SkipHandler()
 
     step = _closing_step(closure)
-    if step is None or step.kind != "amount":
-        # «4000» на текстовом шаге (предоплата / комментарий филиала) — не глотать.
+    if step is None or step.kind not in ("amount", "text"):
         raise SkipHandler()
     if not await _answers_question(message, closure):
         await _need_reply_to_question(message, closure, step)
         return
 
-    amount = Decimal(message.text.strip().replace(",", "."))
-    await db.save_closure_answer(closure["id"], closing.answer_field(step.key), amount, step.key)
+    if step.kind == "amount":
+        await _save_amount(message, closure, step)
+        return
+    await _save_text(message, closure, step)
+
+
+async def _ask_again(message: Message, closure, step, complaint: str) -> None:
+    """Ответ не принят — говорим почему и повторяем вопрос.
+
+    Молчать нельзя: мастер решит, что ответ засчитан, и уйдёт с объекта.
+    """
+    sent = await message.reply(
+        complaint + "\n\n" + messages.closing_question(step, closure["crm_id"]),
+        reply_markup=messages.closing_keyboard(step),
+    )
+    await db.remember_closure_message(closure["id"], sent.message_id, question=True)
+
+
+async def _save_amount(message: Message, closure, step) -> None:
+    amount, problem = closing.parse_amount(message.text)
+    if problem:
+        log.info(
+            "заявка %s: шаг %s — сумма не принята (%s)",
+            closure["crm_id"], step.key, problem,
+        )
+        await _ask_again(message, closure, step, "⚠️ " + problem)
+        return
+
+    await db.save_closure_answer(
+        closure["id"], closing.answer_field(step.key), amount, step.key
+    )
     await db.remember_closure_message(closure["id"], message.message_id)
     log.info("заявка %s: шаг %s = %s", closure["crm_id"], step.key, amount)
     await _advance_closing(message.bot, closure["id"])
 
 
-@dp.message(F.text)
-async def on_closing_text(message: Message) -> None:
+async def _save_text(message: Message, closure, step) -> None:
     """Свободный ответ мастера: комментарий филиала бот записывает как есть."""
-    master = await identify_master(message.from_user)
-    director = _director_closing(message.from_user, message.chat.id)
-    closure = await _message_closure(message, master, is_director=director)
-    if closure is None or closure["state"] != "collecting":
-        return
-
-    step = _closing_step(closure)
-    if step is None or step.kind != "text":
-        return
-    if not await _answers_question(message, closure):
-        await _need_reply_to_question(message, closure, step)
-        return
-
     text = message.text.strip()
     if closure["kind"] == closing.KIND_SD_OPEN and step.key == "comment":
         if closing.parse_sd_ready_at(text) is None:
-            sent = await message.reply(
-                closing.SD_COMMENT_REJECT
-                + "\n\n"
-                + messages.closing_question(step, closure["crm_id"]),
-                reply_markup=messages.closing_keyboard(step),
-            )
-            await db.remember_closure_message(closure["id"], sent.message_id)
+            await _ask_again(message, closure, step, closing.SD_COMMENT_REJECT)
             return
 
     await db.save_closure_answer(
@@ -1150,6 +1266,28 @@ async def _advance(callback: CallbackQuery, crm: CrmClient, state: str) -> None:
     log.info("заявка %s: %s отметил «%s»", crm_id, master["full_name"], state)
 
 
+def _warn_if_unfenced() -> None:
+    """Проведение включено на весь филиал — владелец должен об этом знать.
+
+    Отчёт двигает деньги: сумму заявки, предоплату, стоимость ЗПЧ. Пока
+    новый порядок вопросов не обкатан, CRM_WRITE_ONLY_FOR должен держать
+    одну согласованную заявку. Не запрет — предупреждение: запрет посреди
+    рабочего дня остановил бы филиал.
+    """
+    if not config.CRM_ALLOW_CLOSING or config.CRM_READ_ONLY:
+        return
+    if config.CRM_WRITE_ONLY_FOR:
+        log.info(
+            "обкатка: запись в CRM разрешена только по заявкам %s",
+            ", ".join(sorted(config.CRM_WRITE_ONLY_FOR)),
+        )
+        return
+    log.warning(
+        "проведение заявок включено без обкатки: CRM_WRITE_ONLY_FOR пуст, "
+        "бот вправе проводить любую заявку филиала"
+    )
+
+
 async def main() -> None:
     logging.basicConfig(
         level=config.LOG_LEVEL,
@@ -1174,6 +1312,7 @@ async def main() -> None:
 
     crm._download_file = download
     reporting.attach(bot, roles.owner_chat(), "боте")
+    _warn_if_unfenced()
     bot._crm_download = download  # СД пишется из своего клиента
 
     try:

@@ -663,7 +663,7 @@ async def active_closure(employee_id: int) -> asyncpg.Record | None:
     return await _pool.fetchrow(
         """
         SELECT * FROM closures
-        WHERE employee_id = $1 AND state IN ('collecting', 'pending_admin', 'rejected')
+        WHERE employee_id = $1 AND state IN ('collecting', 'pending_admin')
         ORDER BY id DESC LIMIT 1
         """,
         employee_id,
@@ -721,8 +721,13 @@ async def save_closure_answer(closure_id: int, column: str, value, next_step: st
     )
 
 
-async def add_closure_photo(closure_id: int, kind: str, file_id: str) -> None:
-    await _pool.execute(
+async def add_closure_photo(closure_id: int, kind: str, file_id: str) -> int:
+    """Кладёт снимок в своё окно и возвращает, сколько их там стало.
+
+    Счётчик нужен сразу: он дописывается в вопрос мастеру вместо отдельного
+    «Принято» на каждое фото.
+    """
+    return await _pool.fetchval(
         """
         UPDATE closures
         SET photos = jsonb_set(
@@ -730,6 +735,7 @@ async def add_closure_photo(closure_id: int, kind: str, file_id: str) -> None:
             coalesce(photos -> $2, '[]'::jsonb) || to_jsonb($3::text), true
         )
         WHERE id = $1
+        RETURNING jsonb_array_length(photos -> $2)
         """,
         closure_id,
         kind,
@@ -737,16 +743,24 @@ async def add_closure_photo(closure_id: int, kind: str, file_id: str) -> None:
     )
 
 
-async def remember_closure_message(closure_id: int, message_id: int) -> None:
-    """Копим переписку по отчёту, чтобы потом убрать её из чата мастера."""
+async def remember_closure_message(
+    closure_id: int, message_id: int, *, question: bool = False
+) -> None:
+    """Копим переписку по отчёту, чтобы потом убрать её из чата мастера.
+
+    question=True помечает сообщение с текущим вопросом: на фото-шагах
+    бот дописывает в него счётчик принятых снимков.
+    """
     await _pool.execute(
         """
         UPDATE closures
-        SET chat_messages = chat_messages || to_jsonb($2::bigint)
+        SET chat_messages = chat_messages || to_jsonb($2::bigint),
+            question_message_id = CASE WHEN $3 THEN $2 ELSE question_message_id END
         WHERE id = $1
         """,
         closure_id,
         message_id,
+        question,
     )
 
 
@@ -822,9 +836,56 @@ async def decide_closure(
     )
 
 
+async def discard_closure(closure_id: int, reason: str = "") -> None:
+    """Отчёт отклонён: выводим из активных, чтобы мастер начал анкету с нуля.
+
+    Строку не удаляем — по ней видно, что именно забраковали. Но её фото
+    больше нигде не подхватываются и в CRM не попадут.
+    """
+    await _pool.execute(
+        """
+        UPDATE closures
+        SET state = 'discarded', decided_at = now(), reject_reason = $2
+        WHERE id = $1
+        """,
+        closure_id,
+        reason,
+    )
+
+
+async def closure_awaiting_conduct(closure_id: int) -> asyncpg.Record | None:
+    """Подтверждённый, но ещё не проведённый отчёт — цель кнопки «Повторить»."""
+    return await _pool.fetchrow(
+        """
+        SELECT * FROM closures
+        WHERE id = $1 AND state = 'approved' AND written_at IS NULL
+        """,
+        closure_id,
+    )
+
+
+async def note_conduct_attempt(closure_id: int, error: str = "") -> int:
+    """Считает попытки проведения и помнит последнюю ошибку CRM."""
+    return await _pool.fetchval(
+        """
+        UPDATE closures
+        SET conduct_attempts = conduct_attempts + 1, conduct_error = $2
+        WHERE id = $1
+        RETURNING conduct_attempts
+        """,
+        closure_id,
+        error,
+    )
+
+
 async def mark_closure_written(closure_id: int) -> None:
     await _pool.execute(
-        "UPDATE closures SET state = 'written', written_at = now() WHERE id = $1", closure_id
+        """
+        UPDATE closures
+        SET state = 'written', written_at = now(), conduct_error = NULL
+        WHERE id = $1
+        """,
+        closure_id,
     )
 
 

@@ -287,6 +287,17 @@ def _parse_flashes(tree: HTMLParser) -> list[str]:
     return found
 
 
+def _conducted_status(card: RequestCard) -> bool:
+    """Строго по статусу: «Готов» — заявка проведена.
+
+    Для защиты от повторного проведения блок расчёта не годится: ошибочное
+    «уже проведена» пометит отчёт записанным, и деньги не попадут в CRM
+    вообще. Статус в этом направлении ошибается только в безопасную сторону.
+    """
+    text = card.fields.get("__status_text") or card.labels.get(FIELD_STATUS) or ""
+    return text.startswith("Готов")
+
+
 def _is_conducted(card: RequestCard) -> bool:
     text = card.fields.get("__status_text") or card.labels.get(FIELD_STATUS) or ""
     if text.startswith("Готов"):
@@ -592,9 +603,16 @@ class CrmClient:
     async def _close_locked(
         self, crm_id: int, fields: dict[str, str], files: list | None = None
     ) -> list[str]:
+        card = await self.fetch_request_card(crm_id)
+        if _conducted_status(card):
+            # Повторное «Провести» по уже проведённой заявке ничего не даёт:
+            # поля на ней disabled, а деньги записаны. Молча выходим, чтобы
+            # вторая попытка администратора не превращалась в ошибку.
+            log.info("заявка %s уже проведена в CRM — повторно не пишу", crm_id)
+            return []
+
         # На «Отказ» футер пустой: нет «Сохранить и закрыть», Yii игнорирует POST.
         # Сначала возвращаем в работу; если статус не сдвинулся — поля не запишутся.
-        card = await self.fetch_request_card(crm_id)
         if card.status_code == str(STATUS_REFUSED):
             await self._update_locked(crm_id, {FIELD_STATUS: str(STATUS_IN_WORK)})
             reopened = await self.fetch_request_card(crm_id)

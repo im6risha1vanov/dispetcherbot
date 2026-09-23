@@ -3,6 +3,8 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from aiogram.dispatcher.event.bases import SkipHandler
+
 import closing
 from crm import FIELD_EMPLOYEE
 
@@ -252,7 +254,7 @@ def test_директор_без_реплая_не_пишет_сумму(monkeyp
     message.bot = AsyncMock()
     theirs = {
         "id": 50, "crm_id": 784223, "employee_id": 10679,
-        "kind": closing.KIND_CLOSE, "state": "collecting", "step": "payed",
+        "kind": closing.KIND_CLOSE, "state": "collecting", "step": "total",
         "chat_id": KIM_CHAT,
     }
 
@@ -260,7 +262,12 @@ def test_директор_без_реплая_не_пишет_сумму(monkeyp
         with patch.object(bot.db, "collecting_closure_by_message", AsyncMock(return_value=None)), \
              patch.object(bot.db, "collecting_closures_in_chat", AsyncMock(return_value=[theirs])), \
              patch.object(bot.db, "save_closure_answer", AsyncMock()) as saved:
-            await bot.on_closing_amount(message)
+            try:
+                await bot.on_closing_answer(message)
+            except SkipHandler:
+                # Чужой текст уходит дальше по цепочке: тем же сообщением
+                # диспетчер отвечает мастеру, и глотать его нельзя.
+                pass
             return saved.await_count
 
     assert asyncio.run(scenario()) == 0
@@ -284,7 +291,7 @@ def test_директор_реплаем_пишет_сумму_в_чужой_о�
     message.bot = AsyncMock()
     closure = {
         "id": 50, "crm_id": 784223, "employee_id": 10679,
-        "kind": closing.KIND_CLOSE, "state": "collecting", "step": "payed",
+        "kind": closing.KIND_CLOSE, "state": "collecting", "step": "total",
         "chat_id": KIM_CHAT,
     }
 
@@ -294,7 +301,7 @@ def test_директор_реплаем_пишет_сумму_в_чужой_о�
              patch.object(bot.db, "save_closure_answer", AsyncMock()) as saved, \
              patch.object(bot.db, "remember_closure_message", AsyncMock()), \
              patch.object(bot, "_advance_closing", AsyncMock()) as advance:
-            await bot.on_closing_amount(message)
+            await bot.on_closing_answer(message)
             return saved.await_args.args, advance.await_count
 
     args, advanced = asyncio.run(scenario())
@@ -314,7 +321,8 @@ def test_директор_кладёт_фото_в_окно_crm(monkeypatch):
     message.reply = AsyncMock(return_value=MagicMock(message_id=43))
     photo_closure = {
         "id": 50, "crm_id": 784223, "employee_id": 10679,
-        "kind": closing.KIND_CLOSE, "state": "collecting", "step": "bso_photo",
+        "kind": closing.KIND_CLOSE, "state": "collecting", "step": "docs_photo",
+        "question_message_id": 39,
         "chat_id": KIM_CHAT,
     }
 

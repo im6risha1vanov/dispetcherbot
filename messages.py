@@ -21,6 +21,7 @@ CB_CLOSE_ANSWER = "cans"
 CB_CLOSE_SKIP = "cskip"
 CB_CLOSE_OK = "cok"
 CB_CLOSE_NO = "cno"
+CB_CLOSE_RETRY = "cretry"
 CB_MOVE = "move"
 CB_MOVE_TO = "moveto"
 CB_MOVE_CANCEL = "movecancel"
@@ -92,7 +93,7 @@ def master_keyboard(
         # технику на сложную диагностику.
         # Номер и квартира здесь уже не нужны: мастер на объекте и работает.
         rows = [
-            [InlineKeyboardButton(text="✅ Закрыть заявку", callback_data=f"{CB_CLOSE}:{crm_id}")],
+            [InlineKeyboardButton(text="📋 Отчёт", callback_data=f"{CB_CLOSE}:{crm_id}")],
             [InlineKeyboardButton(text="📦 В работе СД", callback_data=f"{CB_SD}:{crm_id}")],
         ]
     else:
@@ -202,17 +203,33 @@ def closing_keyboard(step) -> InlineKeyboardMarkup | None:
     return None
 
 
-def closing_question(step, crm_id: int) -> str:
+def closing_question(step, crm_id: int, accepted: int = 0) -> str:
+    """Вопрос мастеру. На фото-шаге дописываем, сколько снимков уже приняли.
+
+    Счётчик живёт в самом вопросе: отдельные «Принято» на каждое фото
+    засоряют чат мастера, а он читает его с телефона на объекте.
+    """
     text = f"Закрытие заказа {crm_id}\n\n{step.question}"
     if step.kind in ("amount", "text"):
         text += "\n\n↩️ Ответьте на это сообщение."
+    if step.kind == "photo" and accepted:
+        text += f"\n\n📷 Принято снимков: {accepted}"
     return text
 
 
 def admin_decision_keyboard(closure_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"{CB_CLOSE_OK}:{closure_id}"),
+        InlineKeyboardButton(text="✅ Провести", callback_data=f"{CB_CLOSE_OK}:{closure_id}"),
         InlineKeyboardButton(text="❌ Отклонить", callback_data=f"{CB_CLOSE_NO}:{closure_id}"),
+    ]])
+
+
+def retry_conduct_keyboard(closure_id: int) -> InlineKeyboardMarkup:
+    """CRM не приняла закрытие — отчёт цел, нужна только повторная попытка."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="🔄 Повторить проведение", callback_data=f"{CB_CLOSE_RETRY}:{closure_id}"
+        )
     ]])
 
 

@@ -101,16 +101,18 @@ async def main(chat: int) -> None:
                   messages.master_keyboard(CRM_ID, "inwork"))
 
         await note(bot, chat, "━━━ Ветка 1: мастер закрывает заявку ━━━")
-        for key in ("payed", "spares", "spare_photo", "bso", "bso_photo", "feedback"):
-            step = closing.STEPS[key]
+        for key in ("docs_photo", "zip", "zip_photo", "receipt", "prepay",
+                    "total", "zip_sum", "feedback"):
+            step = closing.CLOSE_STEPS[key]
             await act(bot, chat, "ЧАТ МАСТЕРА · вопрос",
                       messages.closing_question(step, CRM_ID),
                       messages.closing_keyboard(step))
 
         report = {
             "crm_id": CRM_ID, "kind": closing.KIND_CLOSE,
-            "payed_by_customer": 3000, "spares_cost": 500,
-            "with_bso": "1", "fback_mode": "2",
+            "payed_by_customer": 3000, "prepayment_sum": 500,
+            "spares_cost": 500, "with_zip": "1",
+            "with_bso": None, "receipt_mode": "0", "fback_mode": "2",
             "photos": {"spare": ["a"], "bso": ["b", "c"]},
         }
         await act(bot, chat, "ВЫ · отчёт на проверку",

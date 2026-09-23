@@ -1,5 +1,7 @@
 """Сценарий закрытия: какие вопросы задаются и какие фото обязательны."""
 
+from decimal import Decimal
+
 import closing
 
 
@@ -12,100 +14,180 @@ def walk(answers: dict) -> list[str]:
     return path
 
 
-def test_без_запчастей_чек_на_них_не_спрашивают():
-    path = walk({"spares_cost": 0, "with_bso": "0", "fback_mode": "3"})
+def test_без_зпч_про_них_больше_не_спрашивают():
+    path = walk({"with_zip": "0", "fback_mode": "3"})
 
-    assert "spare_photo" not in path
-    assert path == ["payed", "spares", "bso", "feedback"]
-
-
-def test_с_запчастями_чек_обязателен():
-    """Трата без чека не подтверждена — фото спрашиваем сразу после суммы."""
-    path = walk({"spares_cost": 500, "with_bso": "0", "fback_mode": "3"})
-
-    assert path[path.index("spares") + 1] == "spare_photo"
-    assert closing.STEPS["spare_photo"].required is True
+    assert "zip_photo" not in path
+    assert "zip_sum" not in path
+    assert path == ["docs_photo", "zip", "receipt", "prepay", "total", "feedback"]
 
 
-def test_бсо_есть_значит_нужно_фото_бсо():
-    path = walk({"spares_cost": 0, "with_bso": "1", "fback_mode": "3"})
+def test_с_зпч_спрашивают_и_фото_и_сумму():
+    """Трата без чека не подтверждена, поэтому фото обязательно."""
+    path = walk({"with_zip": "1", "fback_mode": "3"})
 
-    assert "bso_photo" in path
+    assert path == [
+        "docs_photo", "zip", "zip_photo", "receipt", "prepay", "total",
+        "zip_sum", "feedback",
+    ]
+    assert closing.CLOSE_STEPS["zip_photo"].required is True
+
+
+def test_анкета_начинается_с_документов():
+    """Документы просим, пока мастер у клиента и может переснять."""
+    assert closing.FIRST_STEP_BY_KIND[closing.KIND_CLOSE] == "docs_photo"
+    assert walk({"with_zip": "0", "fback_mode": "3"})[0] == "docs_photo"
+
+
+def test_отдельного_вопроса_про_бсо_нет():
+    """Ответ виден по тому, прислал мастер снимки или нажал «Готово» пустым."""
+    path = walk({"with_zip": "0", "fback_mode": "3"})
+
+    assert "bso" not in path
+    assert closing.has_bso({"photos": {closing.PHOTO_BSO: ["f1"]}}) is True
+    assert closing.has_bso({"photos": {}}) is False
+
+
+def test_прерванный_старый_отчёт_начинается_заново():
+    """Порядок вопросов изменился: продолжать с прежнего шага нельзя."""
+    assert closing.canonical_step(closing.KIND_CLOSE, "bso") == "docs_photo"
+    assert closing.next_step("payed", {}) == "docs_photo"
 
 
 
 
 def test_отзыв_да_значит_нужно_фото_отзыва():
-    path = walk({"spares_cost": 0, "with_bso": "0", "fback_mode": "1"})
+    path = walk({"with_zip": "0", "fback_mode": "1"})
 
     assert "feedback_photo" in path
 
 
 def test_нет_возможности_отзыва_фото_не_просят():
-    path = walk({"spares_cost": 0, "with_bso": "0", "fback_mode": "3"})
+    path = walk({"with_zip": "0", "fback_mode": "3"})
 
     assert "feedback_photo" not in path
 
 
 
 def test_отзыв_предлагает_все_три_варианта_как_в_crm():
-    assert [value for value, _ in closing.STEPS["feedback"].choices] == ["1", "2", "3"]
+    assert [value for value, _ in closing.CLOSE_STEPS["feedback"].choices] == ["1", "2", "3"]
 
 
 def test_отзыв_нет_фото_не_просит():
     """Фото отзыва есть только тогда, когда отзыв написан."""
-    path = walk({"spares_cost": 0, "with_bso": "0", "fback_mode": "2"})
+    path = walk({"with_zip": "0", "fback_mode": "2"})
 
     assert "feedback_photo" not in path
 
 
 def test_каждое_фото_идёт_в_своё_окно_crm():
     """Подписи окон в CRM не равны именам полей — раскладка задана явно."""
-    windows = {step.photo_kind for step in closing.STEPS.values() if step.kind == "photo"}
+    windows = {step.photo_kind for step in closing.CLOSE_STEPS.values() if step.kind == "photo"}
 
     assert windows & set(closing.PHOTO_FIELDS) == windows
 
 
-def test_ответы_превращаются_в_поля_формы():
+def _close_row(**extra):
     row = {
+        "crm_id": 783175,
         "kind": closing.KIND_CLOSE,
         "payed_by_customer": 3000,
-        "spares_cost": 500.5,
-        "with_bso": "1",
-        "with_zip": None,
-        "receipt_mode": None,
-        "fback_mode": "1",
+        "prepayment_sum": 0,
+        "spares_cost": 0,
+        "with_bso": None,
+        "with_zip": "0",
+        "receipt_mode": "0",
+        "fback_mode": "3",
+        "photos": {},
     }
+    row.update(extra)
+    return row
+
+
+def test_ответы_превращаются_в_поля_формы():
+    row = _close_row(
+        spares_cost=500.5,
+        with_zip="1",
+        prepayment_sum=1000,
+        receipt_mode="10",
+        fback_mode="1",
+        photos={closing.PHOTO_BSO: ["f1"]},
+    )
 
     payload = closing.crm_payload(row)
 
     assert payload[closing.FIELD_PAYED] == "3000"
+    assert payload[closing.FIELD_PREPAY] == "1000"
     assert payload[closing.FIELD_SPARES] == "500.5"
+    assert payload[closing.FIELD_ZIP] == "1"
+    assert payload[closing.FIELD_RECEIPT] == "10"
     assert payload[closing.FIELD_BSO] == "1"
     assert payload[closing.FIELD_FEEDBACK] == "1"
     assert payload[closing.FIELD_REQ_FBACK] == "1"
     assert closing.FIELD_SD_READY_AT not in payload
 
 
+def test_без_фото_бсо_в_crm_уходит_нет():
+    """Мастер нажал «Готово» пустым — выдумывать за него «есть» нельзя."""
+    payload = closing.crm_payload(_close_row(photos={}))
+
+    assert payload[closing.FIELD_BSO] == "0"
+
+
+def test_нулевая_предоплата_уходит_пустой():
+    """Yii рисует ноль в number input пустым — сверка иначе не сойдётся."""
+    assert closing.crm_payload(_close_row())[closing.FIELD_PREPAY] == ""
+
+
 def test_сводка_показывает_ответы_словами():
-    row = {
-        "crm_id": 783175,
-        "kind": closing.KIND_CLOSE,
-        "payed_by_customer": 3000,
-        "spares_cost": 0,
-        "with_bso": "1",
-        "with_zip": "0",
-        "receipt_mode": None,
-        "fback_mode": "3",
-        "photos": {"safetyreceipt": ["f1"]},
-    }
+    row = _close_row(
+        prepayment_sum=500,
+        receipt_mode="5",
+        photos={closing.PHOTO_BSO: ["f1"]},
+    )
 
     text = closing.summary(row, "Мишарин Олег")
 
-    assert "3000" in text
+    assert "Сумма заявки: 3000 р." in text
+    assert "Предоплата: 500 р." in text
     assert "БСО: есть" in text
-    assert "3000" in text
+    assert "чек взято всего" in text
     assert "нет возможности" in text
+
+
+def test_сводка_предупреждает_но_не_запрещает():
+    """ЗПЧ дороже заявки бывает. Решает человек, бот только показывает."""
+    row = _close_row(
+        with_zip="1", spares_cost=5000, prepayment_sum=4000,
+        photos={closing.PHOTO_BSO: ["f1"]},
+    )
+
+    alarms = closing.report_warnings(row)
+    text = closing.summary(row, "Мишарин Олег")
+
+    assert any("ЗПЧ дороже" in line for line in alarms)
+    assert any("Предоплата больше" in line for line in alarms)
+    assert "ЗПЧ дороже" in text
+
+
+def test_отсутствие_бсо_отмечено_в_сводке():
+    alarms = closing.report_warnings(_close_row(photos={}))
+
+    assert any("БСО" in line for line in alarms)
+
+
+def test_суммы_проверяются_на_мусор_и_потолок():
+    assert closing.parse_amount("3500")[0] == 3500
+    assert closing.parse_amount("3 500,50")[0] == Decimal("3500.50")
+    assert closing.parse_amount("0")[0] == 0
+
+    for junk in ("где-то три тыщи", "-100", "", "1500р", "1.2.3"):
+        value, problem = closing.parse_amount(junk)
+        assert value is None and problem, junk
+
+    value, problem = closing.parse_amount("99999999")
+    assert value is None
+    assert "опечатку" in problem
 
 
 def test_сводка_принимает_фото_строкой_json():
@@ -176,9 +258,9 @@ def test_режим_чека_всегда_без_чека():
     assert closing.crm_payload(row)[closing.FIELD_RECEIPT] == closing.RECEIPT_NONE
 
 
-def test_бсо_ждёт_несколько_снимков():
+def test_документы_ждут_несколько_снимков():
     """БСО и чек самозанятого приходят вместе, поэтому шаг не закрывается сам."""
-    assert closing.STEPS["bso_photo"].multi is True
+    assert closing.CLOSE_STEPS["docs_photo"].multi is True
 
 
 def walk_kind(kind: str, answers: dict) -> list[str]:
@@ -280,10 +362,10 @@ def test_закрытие_сд_не_шлёт_фиктивные_срок_сум�
 
 
 def test_обычное_закрытие_без_комментария_филиала():
-    path = walk({"spares_cost": 0, "with_bso": "0", "fback_mode": "3"})
+    path = walk({"with_zip": "0", "fback_mode": "3"})
 
     assert "comment" not in path
-    assert path == ["payed", "spares", "bso", "feedback"]
+    assert path == ["docs_photo", "zip", "receipt", "prepay", "total", "feedback"]
 
 
 def test_комментарий_филиала_только_ответом_на_вопрос():
@@ -335,7 +417,7 @@ def test_при_закрытии_и_сд_лишних_кнопок_нет():
     kb = messages.master_keyboard(1, "inwork")
     titles = [b.text for row in kb.inline_keyboard for b in row]
 
-    assert any("Закрыть" in t for t in titles)
+    assert any("Отчёт" in t for t in titles)
     assert any("СД" in t for t in titles)
     assert not any("Номер" in t or "квартир" in t for t in titles)
 

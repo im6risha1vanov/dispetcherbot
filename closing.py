@@ -8,10 +8,14 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
+
+import config
 
 # Поля формы CRM, которые заполняет мастер при закрытии.
 FIELD_PAYED = "CustomerRequest[payed_by_customer]"
 FIELD_SPARES = "CustomerRequest[spares_cost]"
+FIELD_PREPAY = "CustomerRequest[prepayment]"
 FIELD_BSO = "CustomerRequest[with_bso]"
 FIELD_ZIP = "CustomerRequest[with_zip]"
 FIELD_RECEIPT = "CustomerRequest[receipt_mode]"
@@ -56,39 +60,53 @@ class Step:
     multi: bool = False  # ждём несколько снимков и кнопку «Готово»
 
 
-STEPS = {
-    "payed": Step("payed", "Сколько оплатил клиент? Сумма в рублях.", "amount"),
-    "spares": Step("spares", "Стоимость комплектующих? Если не было — 0.", "amount"),
-    "spare_photo": Step(
-        "spare_photo",
-        "Пришлите фото чека на запчасти. Когда всё отправите — нажмите «Готово».",
-        "photo",
-        photo_kind=PHOTO_SPARE_CHECK,
-        multi=True,
-    ),
-    "bso": Step(
-        "bso", "БСО есть?", "choice", (("1", "Есть"), ("0", "Нет")),
-    ),
-    "bso_photo": Step(
-        "bso_photo",
-        "Пришлите фото БСО и чека самозанятого. Когда всё отправите — нажмите «Готово».",
+# Отзыв спрашивают и обычное закрытие, и закрытие СД — шаг один на двоих.
+FEEDBACK_STEP = Step(
+    "feedback",
+    "Отзыв?",
+    "choice",
+    (("1", "Да"), ("2", "Нет"), ("3", "Нет возможности")),
+)
+FEEDBACK_PHOTO_STEP = Step(
+    "feedback_photo",
+    "Пришлите фото отзыва. Когда всё отправите — нажмите «Готово».",
+    "photo",
+    photo_kind=PHOTO_FEEDBACK,
+    multi=True,
+)
+
+# Анкета закрытия заявки. Порядок задан мастером: сначала документы, пока он
+# ещё у клиента и может переснять, суммы — в конце, когда всё посчитано.
+#
+# Отдельного вопроса «БСО есть?» нет: ответ виден по тому, прислал мастер фото
+# или нажал «Готово» пустым. Лишний вопрос там, где ответ уже дан делом.
+CLOSE_STEPS = {
+    "docs_photo": Step(
+        "docs_photo",
+        "Загрузите фото БСО и чека СМЗ. Когда всё отправите — нажмите «Готово».",
         "photo",
         photo_kind=PHOTO_BSO,
         multi=True,
     ),
-    "feedback": Step(
-        "feedback",
-        "Отзыв?",
-        "choice",
-        (("1", "Да"), ("2", "Нет"), ("3", "Нет возможности")),
-    ),
-    "feedback_photo": Step(
-        "feedback_photo",
-        "Пришлите фото отзыва. Когда всё отправите — нажмите «Готово».",
+    "zip": Step("zip", "Есть ли ЗПЧ?", "choice", (("1", "Да"), ("0", "Нет"))),
+    "zip_photo": Step(
+        "zip_photo",
+        "Загрузите фото ЗПЧ. Когда всё отправите — нажмите «Готово».",
         "photo",
-        photo_kind=PHOTO_FEEDBACK,
+        photo_kind=PHOTO_SPARE_CHECK,
         multi=True,
     ),
+    "receipt": Step(
+        "receipt",
+        "Режим для чека",
+        "choice",
+        (("0", "Без чека"), ("5", "Чек взято всего"), ("10", "Чек чистыми")),
+    ),
+    "prepay": Step("prepay", "Предоплата? Сумма в рублях, если её не было — 0.", "amount"),
+    "total": Step("total", "Сумма заявки? Число в рублях.", "amount"),
+    "zip_sum": Step("zip_sum", "Сумма ЗПЧ? Число в рублях.", "amount"),
+    "feedback": FEEDBACK_STEP,
+    "feedback_photo": FEEDBACK_PHOTO_STEP,
 }
 
 # Живая карточка: label «Комментарий филиала», textarea name=...[recommendation_comment].
@@ -152,10 +170,18 @@ SD_STEPS = {
 }
 
 # Закрытие СД: документы вместо БСО, поэтому про БСО не спрашиваем.
+# Анкета осталась прежней — её порядок мастера уже знают, а техника у них
+# на руках неделями: менять вопросы на полпути незачем.
 SD_CLOSE_STEPS = {
     "payed": Step("payed", "Сколько оплатил клиент? Итоговая сумма, включая предоплату.", "amount"),
-    "spares": STEPS["spares"],
-    "spare_photo": STEPS["spare_photo"],
+    "spares": Step("spares", "Стоимость комплектующих? Если не было — 0.", "amount"),
+    "spare_photo": Step(
+        "spare_photo",
+        "Пришлите фото чека на запчасти. Когда всё отправите — нажмите «Готово».",
+        "photo",
+        photo_kind=PHOTO_SPARE_CHECK,
+        multi=True,
+    ),
     "safety_photo": Step(
         "safety_photo",
         "Пришлите фото договора сложной диагностики и чека самозанятого. "
@@ -164,8 +190,8 @@ SD_CLOSE_STEPS = {
         photo_kind=PHOTO_SAFETY,
         multi=True,
     ),
-    "feedback": STEPS["feedback"],
-    "feedback_photo": STEPS["feedback_photo"],
+    "feedback": FEEDBACK_STEP,
+    "feedback_photo": FEEDBACK_PHOTO_STEP,
 }
 
 KIND_CLOSE = "close"
@@ -174,30 +200,38 @@ KIND_SD_CLOSE = "sd_close"
 KIND_REMOTE = "remote"  # гарантия решена звонком: вопросов нет, всё по нулям
 
 STEPS_BY_KIND = {
-    KIND_CLOSE: STEPS,
+    KIND_CLOSE: CLOSE_STEPS,
     KIND_SD_OPEN: SD_STEPS,
     KIND_SD_CLOSE: SD_CLOSE_STEPS,
     KIND_REMOTE: {},
 }
 
+FIRST_CLOSE_STEP = "docs_photo"
+
 FIRST_STEP_BY_KIND = {
-    KIND_CLOSE: "payed",
+    KIND_CLOSE: FIRST_CLOSE_STEP,
     KIND_SD_OPEN: "safety_photo",
     KIND_SD_CLOSE: "payed",
 }
 
-FIRST_STEP = "payed"
+FIRST_STEP = FIRST_CLOSE_STEP
 
 
 SD_ORDER = ["safety_photo", "comment"]
 # Старые вопросы срока/суммы/неисправности: незавершённый отчёт после выкладки
 # сразу переводим на один комментарий, а не продолжаем цепочку.
 LEGACY_SD_OPEN_STEPS = frozenset({"prepayment", "agreed_sum", "deadline", "malfunction"})
+# Прежняя анкета закрытия (суммы первыми). Отчёт, застигнутый выкладкой на
+# середине, начинаем заново: порядок вопросов изменился, и продолжать с
+# середины — значит спросить не то и не в том порядке.
+LEGACY_CLOSE_STEPS = frozenset({"payed", "spares", "spare_photo", "bso", "bso_photo"})
 
 
 def canonical_step(kind: str, step: str) -> str:
     if kind == KIND_SD_OPEN and step in LEGACY_SD_OPEN_STEPS:
         return "comment"
+    if kind == KIND_CLOSE and step in LEGACY_CLOSE_STEPS:
+        return FIRST_CLOSE_STEP
     return step
 
 
@@ -228,21 +262,31 @@ def _next_sd_close(step: str, answers) -> str | None:
 
 
 def next_step(step: str, answers) -> str | None:
-    """Следующий вопрос. Фото просим только там, где ответ этого требует."""
-    if step == "payed":
-        return "spares"
-    if step == "spares":
+    """Следующий вопрос закрытия. Про ЗПЧ спрашиваем только если они были."""
+    if step in LEGACY_CLOSE_STEPS:
+        return FIRST_CLOSE_STEP
+    if step == "docs_photo":
+        return "zip"
+    if step == "zip":
         # Купил запчасти — чек обязателен, иначе трата не подтверждена.
-        return "spare_photo" if _positive(answers.get("spares_cost")) else "bso"
-    if step == "spare_photo":
-        return "bso"
-    if step == "bso":
-        return "bso_photo" if answers.get("with_bso") == "1" else "feedback"
-    if step == "bso_photo":
+        return "zip_photo" if _has_zip(answers) else "receipt"
+    if step == "zip_photo":
+        return "receipt"
+    if step == "receipt":
+        return "prepay"
+    if step == "prepay":
+        return "total"
+    if step == "total":
+        return "zip_sum" if _has_zip(answers) else "feedback"
+    if step == "zip_sum":
         return "feedback"
     if step == "feedback":
         return "feedback_photo" if answers.get("fback_mode") == "1" else None
     return None  # feedback_photo — последний
+
+
+def _has_zip(answers) -> bool:
+    return str(_row_get(answers, "with_zip") or "") == "1"
 
 
 def _positive(value) -> bool:
@@ -252,12 +296,50 @@ def _positive(value) -> bool:
         return False
 
 
+# Сумма: цифры, пробелы как разделители тысяч, не больше двух знаков после
+# запятой. Минус не проходит регуляркой — отрицательной суммы не бывает.
+_AMOUNT = re.compile(r"^\s*(\d[\d \u00a0]*?)(?:[.,](\d{1,2}))?\s*$")
+
+AMOUNT_HINT = "Нужно число в рублях, без слов. Например: 3500 или 3500,50"
+
+
+def parse_amount(text: str) -> tuple[Decimal | None, str]:
+    """Сумма из ответа мастера либо причина отказа простыми словами.
+
+    Молчать на «где-то три тыщи» нельзя: мастер решит, что ответ принят,
+    и уйдёт с объекта. Поэтому на всё непонятное отвечаем и просим ещё раз.
+    """
+    match = _AMOUNT.match(text or "")
+    if match is None:
+        return None, AMOUNT_HINT
+
+    digits = re.sub(r"[ \u00a0]", "", match.group(1))
+    kopecks = match.group(2)
+    try:
+        value = Decimal(digits + ("." + kopecks if kopecks else ""))
+    except InvalidOperation:
+        return None, AMOUNT_HINT
+
+    if value > config.CLOSING_MAX_SUM:
+        return None, (
+            f"Сумма больше {int(config.CLOSING_MAX_SUM)} р. — похоже на опечатку. "
+            "Проверьте и пришлите ещё раз."
+        )
+    return value, ""
+
+
 def answer_field(step: str) -> str:
     return {
+        # анкета закрытия
+        "zip": "with_zip",
+        "receipt": "receipt_mode",
+        "prepay": "prepayment_sum",
+        "total": "payed_by_customer",
+        "zip_sum": "spares_cost",
+        # закрытие СД и старые отчёты
         "payed": "payed_by_customer",
         "spares": "spares_cost",
         "bso": "with_bso",
-        "receipt": "receipt_mode",
         "feedback": "fback_mode",
         "comment": "branch_comment",
         "prepayment": "prepayment",
@@ -299,6 +381,15 @@ REMOTE_PAYLOAD = {
 }
 
 
+def has_bso(row) -> bool:
+    """БСО выписан, если мастер прислал хоть один снимок документов.
+
+    Отдельного вопроса нет намеренно: ответ уже дан делом, а лишний шаг в
+    анкете — лишний повод ошибиться.
+    """
+    return bool(as_dict(_row_get(row, "photos")).get(PHOTO_BSO))
+
+
 def crm_payload(row) -> dict[str, str]:
     """Ответы мастера в виде полей формы CRM."""
     if row["kind"] == KIND_REMOTE:
@@ -313,20 +404,26 @@ def crm_payload(row) -> dict[str, str]:
         # без комплектующих). Шлём пустую строку, иначе сверка ждёт «0».
         FIELD_SPARES: _num(row["spares_cost"]) if _positive(row["spares_cost"]) else "",
     }
-    for field, column in (
-        (FIELD_BSO, "with_bso"),
-        (FIELD_FEEDBACK, "fback_mode"),
-    ):
-        if row[column] is not None:
-            payload[field] = str(row[column])
 
+    if row["kind"] == KIND_CLOSE:
+        payload[FIELD_BSO] = "1" if has_bso(row) else "0"
+        prepay = _row_get(row, "prepayment_sum")
+        payload[FIELD_PREPAY] = _num(prepay) if _positive(prepay) else ""
+        # Наличие ЗПЧ спрашиваем прямо: мастер мог поставить свою запчасть
+        # и не потратить ни рубля, из суммы это не выводится.
+        payload[FIELD_ZIP] = "1" if _has_zip(row) else "0"
+        payload[FIELD_RECEIPT] = str(_row_get(row, "receipt_mode") or RECEIPT_NONE)
+    else:
+        # Закрытие СД: про БСО не спрашивали, режим чека там всегда без чека.
+        if row["with_bso"] is not None:
+            payload[FIELD_BSO] = str(row["with_bso"])
+        payload[FIELD_ZIP] = "1" if _positive(row["spares_cost"]) else "0"
+        payload[FIELD_RECEIPT] = RECEIPT_NONE
+
+    if row["fback_mode"] is not None:
+        payload[FIELD_FEEDBACK] = str(row["fback_mode"])
     if payload.get(FIELD_FEEDBACK) in {"1", "2", "3"}:
         payload[FIELD_REQ_FBACK] = "1"
-
-    # Эти поля мастеру не показываем: использование комплектующих следует из
-    # суммы, а режим чека в филиале всегда «Без чека».
-    payload[FIELD_ZIP] = "1" if _positive(row["spares_cost"]) else "0"
-    payload[FIELD_RECEIPT] = RECEIPT_NONE
     return payload
 
 
@@ -375,7 +472,67 @@ def summary(row, master_name: str) -> str:
     return _closing_summary(row, master_name, title, photo_note)
 
 
+def report_warnings(row) -> list[str]:
+    """Странности, о которых администратор должен знать до нажатия «Провести».
+
+    Ни одна из них не блокирует проведение: так бывает, и решать человеку.
+    """
+    found = []
+    if row["kind"] != KIND_CLOSE:
+        return found
+
+    total = _amount(row["payed_by_customer"])
+    spares = _amount(row["spares_cost"])
+    prepay = _amount(_row_get(row, "prepayment_sum"))
+
+    if spares > total:
+        found.append(f"ЗПЧ дороже заявки: {_num(spares)} р. против {_num(total)} р.")
+    if prepay > total:
+        found.append(f"Предоплата больше суммы заявки: {_num(prepay)} р. против {_num(total)} р.")
+    if _has_zip(row) and not spares:
+        found.append("ЗПЧ отмечены, а сумма по ним нулевая")
+    if not has_bso(row):
+        found.append("Фото БСО и чека СМЗ не приложены — в CRM уйдёт «БСО: нет»")
+    return found
+
+
+def _amount(value) -> Decimal:
+    try:
+        return Decimal(str(value or 0))
+    except InvalidOperation:
+        return Decimal(0)
+
+
 def _closing_summary(row, master_name: str, title: str, photo_note: str) -> str:
+    if row["kind"] != KIND_CLOSE:
+        return _sd_close_summary(row, master_name, title, photo_note)
+
+    receipt = {"0": "без чека", "5": "чек взято всего", "10": "чек чистыми"}
+    feedback = {"1": "да", "2": "нет", "3": "нет возможности"}
+    zip_line = "есть" if _has_zip(row) else "нет"
+    if _has_zip(row):
+        zip_line += f", {_num(row['spares_cost'])} р."
+
+    lines = [
+        f"{title} по заказу {row['crm_id']}",
+        f"Мастер: {master_name}",
+        "",
+        f"Сумма заявки: {_num(row['payed_by_customer'])} р.",
+        f"Предоплата: {_num(_row_get(row, 'prepayment_sum'))} р.",
+        f"ЗПЧ: {zip_line}",
+        f"Режим чека: {receipt.get(str(_row_get(row, 'receipt_mode') or '0'), '—')}",
+        f"БСО: {'есть' if has_bso(row) else 'нет'}",
+        f"Отзыв: {feedback.get(row['fback_mode'], '—')}",
+        f"Фото: {photo_note}",
+    ]
+    alarms = report_warnings(row)
+    if alarms:
+        lines.append("")
+        lines.extend(f"⚠️ {text}" for text in alarms)
+    return "\n".join(lines)
+
+
+def _sd_close_summary(row, master_name: str, title: str, photo_note: str) -> str:
     choice = {
         "with_bso": {"1": "есть", "0": "нет"},
         "fback_mode": {"1": "да", "2": "нет", "3": "нет возможности"},

@@ -52,6 +52,7 @@ ENROUTE_CARD = CARD.replace(
 CLOSE_CARD = CARD.replace(
     '<input name="CustomerRequest[payed_by_customer]" value="0">',
     """<input name="CustomerRequest[payed_by_customer]" value="">
+  <input name="CustomerRequest[prepayment]" value="">
   <input name="CustomerRequest[spares_cost]" value="">
   <select name="CustomerRequest[fback_mode]">
     <option value="">Выберите...</option>
@@ -71,6 +72,8 @@ CLOSE_CARD = CARD.replace(
   </select>
   <select name="CustomerRequest[receipt_mode]">
     <option value="0" selected>Без чека</option>
+    <option value="5">Чек взято всего</option>
+    <option value="10">Чек чистыми</option>
   </select>
   <script>window.fileinput_x={"uploadUrl":"/admin/domain/customer-request/image-upload?id=781594_abc&target=images_main"};</script>""",
 )
@@ -417,13 +420,19 @@ def _pick_options(options: list[tuple[str, str]], selected: str) -> str:
 def _saved_close_card(**repl) -> str:
     """Как живая карточка после save_close: выбранные option, не «Выберите...»."""
     payed = repl.get("payed", "1500")
+    prepay = repl.get("prepay", "")
     fback = repl.get("fback", "3")
     bso = repl.get("bso", "1")
     zip_val = repl.get("zip", "0")
+    receipt = repl.get("receipt", "0")
     html = CLOSE_CARD
     html = html.replace(
         '<input name="CustomerRequest[payed_by_customer]" value="">',
         f'<input name="CustomerRequest[payed_by_customer]" value="{payed}">',
+    )
+    html = html.replace(
+        '<input name="CustomerRequest[prepayment]" value="">',
+        f'<input name="CustomerRequest[prepayment]" value="{prepay}">',
     )
     html = html.replace(
         """<select name="CustomerRequest[fback_mode]">
@@ -457,6 +466,19 @@ def _saved_close_card(**repl) -> str:
   </select>""",
         "<select name=\"CustomerRequest[with_zip]\">\n"
         + _pick_options([("", "Выберите"), ("0", "Нет"), ("1", "Есть")], zip_val)
+        + "\n  </select>",
+    )
+    html = html.replace(
+        """<select name="CustomerRequest[receipt_mode]">
+    <option value="0" selected>Без чека</option>
+    <option value="5">Чек взято всего</option>
+    <option value="10">Чек чистыми</option>
+  </select>""",
+        "<select name=\"CustomerRequest[receipt_mode]\">\n"
+        + _pick_options(
+            [("0", "Без чека"), ("5", "Чек взято всего"), ("10", "Чек чистыми")],
+            receipt,
+        )
         + "\n  </select>",
     )
     return html
@@ -799,3 +821,81 @@ def test_открытие_сд_пишет_срок_вторым_постом_е�
     assert closing.FIELD_SD_READY_AT not in crm.writes[0]
     assert crm.writes[1][closing.FIELD_SD_READY_AT] == "19-09-2026"
     assert crm.writes[0][closing.FIELD_COMMENT] == SD_COMMENT
+
+
+def _conducted_card() -> str:
+    """Карточка проведённой заявки: вместо селекта статуса — «Готов»."""
+    return CLOSE_CARD.replace(
+        """<select name="CustomerRequest[status]">
+    <option value="1" selected>Ожидает</option>
+    <option value="4">В пути</option>
+  </select>""",
+        CONDUCTED_FOOTER,
+    )
+
+
+def test_отчёт_кладёт_предоплату_режим_чека_и_зпч(monkeypatch):
+    """Состав обоих запросов: save_close в первом, finish=1 во втором."""
+    monkeypatch.setattr(config, "CRM_READ_ONLY", False)
+    monkeypatch.setattr(config, "CRM_WRITE_ONLY_FOR", frozenset())
+    crm = FakeCrm(card=CLOSE_CARD)
+    saved = _saved_close_card(payed="3500", prepay="1000", zip="1", receipt="10", fback="2")
+    crm.card_after = saved
+    crm.card_finish = saved.replace(
+        """<select name="CustomerRequest[status]">
+    <option value="1" selected>Ожидает</option>
+    <option value="4">В пути</option>
+  </select>""",
+        CONDUCTED_FOOTER,
+    )
+
+    row = {
+        "kind": closing.KIND_CLOSE,
+        "payed_by_customer": 3500,
+        "prepayment_sum": 1000,
+        "spares_cost": 0,
+        "with_bso": None,
+        "with_zip": "1",
+        "receipt_mode": "10",
+        "fback_mode": "2",
+        "photos": {closing.PHOTO_BSO: ["tgfile1"]},
+    }
+
+    async def scenario(c):
+        async def download(_fid):
+            return b"jpeg"
+        c._download_file = download
+        return await c.close_request(781594, closing.crm_payload(row), row["photos"])
+
+    damage = run_write(crm, scenario)
+
+    assert damage == []
+    forms = [w for w in crm.writes if not w.get("_multipart")]
+    assert len(forms) == 2, "сначала сохранение, потом проведение"
+
+    first, second = forms
+    assert first["save_close"] == "1"
+    assert "save_close" not in second
+    assert "finish=1" not in crm.write_urls[0]
+    assert "finish=1" in crm.write_urls[1]
+
+    assert first[closing.FIELD_PAYED] == "3500"
+    assert first[closing.FIELD_PREPAY] == "1000"
+    assert first[closing.FIELD_ZIP] == "1"
+    assert first[closing.FIELD_RECEIPT] == "10"
+    assert first[closing.FIELD_BSO] == "1", "фото документов означают «БСО есть»"
+    assert first[closing.FIELD_REQ_FBACK] == "1"
+
+
+def test_проведённую_заявку_второй_раз_не_пишем(monkeypatch):
+    """Повтор «Провести» по закрытой заявке не должен трогать карточку."""
+    monkeypatch.setattr(config, "CRM_READ_ONLY", False)
+    monkeypatch.setattr(config, "CRM_WRITE_ONLY_FOR", frozenset())
+    crm = FakeCrm(card=_conducted_card())
+
+    damage = run_write(
+        crm, lambda c: c.close_request(781594, {closing.FIELD_PAYED: "3500"}, {})
+    )
+
+    assert damage == []
+    assert crm.writes == [], "по проведённой заявке записи быть не должно"
