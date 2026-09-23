@@ -315,10 +315,14 @@ def test_директор_кладёт_фото_в_окно_crm(monkeypatch):
     message = AsyncMock()
     message.from_user = MagicMock(id=708703366)
     message.chat.id = KIM_CHAT
-    message.reply_to_message = None
     message.photo = [MagicMock(file_id="tgfile-bso")]
     message.message_id = 42
     message.reply = AsyncMock(return_value=MagicMock(message_id=43))
+    # Фото засчитывается только реплаем на вопрос бота — как и текст.
+    asked = MagicMock(message_id=41, text="Закрытие заказа 784223", caption=None)
+    asked.from_user = MagicMock(is_bot=True)
+    asked.reply_to_message = None
+    message.reply_to_message = asked
     photo_closure = {
         "id": 50, "crm_id": 784223, "employee_id": 10679,
         "kind": closing.KIND_CLOSE, "state": "collecting", "step": "docs_photo",
@@ -331,7 +335,9 @@ def test_директор_кладёт_фото_в_окно_crm(monkeypatch):
              patch.object(
                  bot.db, "collecting_closures_in_chat", AsyncMock(return_value=[photo_closure])
              ), \
-             patch.object(bot, "_keep_photo", AsyncMock(return_value="tgfile-bso")),              patch.object(bot.db, "add_closure_photo", AsyncMock(return_value=1)) as added, \
+             patch.object(bot, "_keep_photo", AsyncMock(return_value="tgfile-bso")),              patch.object(bot.db, "closure_messages", AsyncMock(return_value=[])),              patch.object(
+                 bot.db, "collecting_closure_by_crm", AsyncMock(return_value=photo_closure)
+             ),              patch.object(bot.db, "add_closure_photo", AsyncMock(return_value=1)) as added, \
              patch.object(bot.db, "remember_closure_message", AsyncMock()):
             await bot.on_closing_photo(message)
             return added.await_args.args

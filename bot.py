@@ -941,8 +941,12 @@ def _written_line(closure) -> str:
 async def on_closing_photo(message: Message) -> None:
     """Фото во время отчёта ложится в то окно CRM, о котором был вопрос.
 
-    Снимок мастера удаляется сразу, как только попал в базу: чат мастера
-    читают с телефона на объекте, и десяток картинок мешает найти заявку.
+    Засчитываем только реплай на вопрос бота — ровно как текст. Иначе любой
+    снимок, присланный в чат просто так, уходил в последний незавершённый
+    отчёт мастера: в чате он исчезал, а в CRM не попадал никогда.
+
+    Снимок удаляется сразу, как только попал в базу: чат мастера читают
+    с телефона на объекте, и десяток картинок мешает найти заявку.
     """
     master = await identify_master(message.from_user)
     director = _director_closing(message.from_user, message.chat.id)
@@ -954,6 +958,9 @@ async def on_closing_photo(message: Message) -> None:
 
     step = _closing_step(closure)
     if step is None or step.kind != "photo":
+        return
+    if not await _answers_question(message, closure):
+        await _need_reply_to_question(message, closure, step)
         return
 
     stored = await _keep_photo(message, message.photo[-1].file_id)
@@ -1118,7 +1125,7 @@ async def _need_reply_to_question(message: Message, closure, step) -> None:
         + messages.closing_question(step, closure["crm_id"]),
         reply_markup=messages.closing_keyboard(step),
     )
-    await db.remember_closure_message(closure["id"], sent.message_id)
+    await db.remember_closure_message(closure["id"], sent.message_id, question=True)
 
 
 def _closing_step(closure):

@@ -196,12 +196,21 @@ def _tg():
     return tg
 
 
-def _reply_message(bot_module, store, closure_id, text):
-    """Сообщение мастера реплаем на текущий вопрос бота."""
-    question_id = store.rows[closure_id]["question_message_id"]
-    replied = MagicMock(message_id=question_id, text="Закрытие заказа", caption=None)
+def _question_of(store, closure_id):
+    """Сообщение бота с текущим вопросом — якорь для реплая."""
+    replied = MagicMock(
+        message_id=store.rows[closure_id]["question_message_id"],
+        text="Закрытие заказа",
+        caption=None,
+    )
     replied.from_user = MagicMock(is_bot=True)
     replied.reply_to_message = None
+    return replied
+
+
+def _reply_message(bot_module, store, closure_id, text):
+    """Сообщение мастера реплаем на текущий вопрос бота."""
+    replied = _question_of(store, closure_id)
 
     message = AsyncMock()
     message.from_user = MagicMock(id=111, username="trentere")
@@ -214,13 +223,15 @@ def _reply_message(bot_module, store, closure_id, text):
     return message
 
 
-def _photo_message(store, closure_id, file_id):
+def _photo_message(store, closure_id, file_id, *, as_reply=True):
     message = AsyncMock()
     message.from_user = MagicMock(id=111, username="trentere")
     message.chat.id = KIM_CHAT
     message.photo = [MagicMock(file_id=file_id)]
     message.message_id = 800 + len(store.rows[closure_id]["photos"].get("bso", []))
-    message.reply_to_message = None
+    # Снимок засчитывается только реплаем на вопрос бота — как и текст.
+    message.reply_to_message = _question_of(store, closure_id) if as_reply else None
+    message.reply = AsyncMock(side_effect=lambda *a, **kw: MagicMock(message_id=778))
     message.bot = _tg()
     # Снимок бот забирает из Telegram сразу же, а не перед записью в CRM.
     message.bot.get_file = AsyncMock(return_value=MagicMock(file_path="tg/path.jpg"))
@@ -256,8 +267,8 @@ class Run:
             self.tg, row, closing.FIRST_STEP_BY_KIND[row["kind"]]
         )
 
-    async def photo(self, file_id="f1"):
-        message = _photo_message(self.store, self.id, file_id)
+    async def photo(self, file_id="f1", *, as_reply=True):
+        message = _photo_message(self.store, self.id, file_id, as_reply=as_reply)
         with patch.object(self.bot, "_message_closure", AsyncMock(
             return_value=await self.bot.db.closure_by_id(self.id)
         )):
@@ -574,5 +585,28 @@ def test_владелец_не_проводит_заявку(monkeypatch, tmp_pa
 
         crm.close_request.assert_not_called()
         assert run.store.rows[run.id]["state"] == "pending_admin"
+    finally:
+        run.close()
+
+
+def test_фото_без_реплая_не_попадает_в_отчёт(monkeypatch, tmp_path):
+    """Снимок «просто так» уходил в последний незавершённый отчёт и пропадал.
+
+    В чате мастера он исчезал, в CRM не попадал никогда: отчёт был брошен
+    неделю назад и завершать его никто не собирался.
+    """
+    run = Run(monkeypatch, tmp_path)
+    try:
+        async def scenario():
+            await run.ask_first()
+            message = await run.photo("случайное фото", as_reply=False)
+            return message
+
+        message = asyncio.run(scenario())
+        row = run.store.rows[run.id]
+
+        assert row["photos"] == {}, "снимок без реплая не должен попадать в отчёт"
+        message.reply.assert_awaited()
+        assert "реплаем" in message.reply.await_args.args[0]
     finally:
         run.close()
