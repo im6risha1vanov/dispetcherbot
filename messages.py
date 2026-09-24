@@ -22,6 +22,10 @@ CB_CLOSE_SKIP = "cskip"
 CB_CLOSE_OK = "cok"
 CB_CLOSE_NO = "cno"
 CB_CLOSE_RETRY = "cretry"
+CB_DAY_PAUSE = "daypause"
+CB_DAY_RESUME = "dayresume"
+CB_DAY_ENABLE = "dayenable"
+CB_DAY_REFRESH = "dayrefresh"
 CB_MOVE = "move"
 CB_MOVE_TO = "moveto"
 CB_MOVE_CANCEL = "movecancel"
@@ -231,6 +235,61 @@ def retry_conduct_keyboard(closure_id: int) -> InlineKeyboardMarkup:
             text="🔄 Повторить проведение", callback_data=f"{CB_CLOSE_RETRY}:{closure_id}"
         )
     ]])
+
+
+def _roster_state(row) -> str:
+    if row["paused_at"]:
+        return "занят до конца дня"
+    if row["is_busy"]:
+        return f"на заявке {row['busy_with']}" if row["busy_with"] else "на заявке"
+    return "свободен"
+
+
+def roster_text(day, rows) -> str:
+    """Панель дня: кто в очереди, кто выпал и почему."""
+    queue, idle, off = [], [], []
+    for row in rows:
+        if not row["is_active"]:
+            off.append(f"· {row['full_name']}")
+        elif row["position"] is None:
+            idle.append(f"· {row['full_name']}")
+        else:
+            queue.append(f"{row['position']}. {row['full_name']} — {_roster_state(row)}")
+
+    blocks = [f"👥 Мастера на {day.strftime('%d.%m')}"]
+    blocks.append("В очереди:\n" + "\n".join(queue) if queue else "В очереди пусто.")
+    if idle:
+        blocks.append("Не отмечались сегодня:\n" + "\n".join(idle))
+    if off:
+        blocks.append("Выключены:\n" + "\n".join(off))
+    return "\n\n".join(blocks)
+
+
+def roster_keyboard(rows, *, is_director: bool) -> InlineKeyboardMarkup:
+    """По кнопке на мастера. Подпись описывает действие, а не состояние."""
+    buttons = []
+    for row in rows:
+        name, who = row["full_name"], row["employee_id"]
+        if not row["is_active"]:
+            if is_director:
+                buttons.append([InlineKeyboardButton(
+                    text=f"✅ Включить: {name}",
+                    callback_data=f"{CB_DAY_ENABLE}:{who}",
+                )])
+        elif row["paused_at"] or row["position"] is None:
+            buttons.append([InlineKeyboardButton(
+                text=f"▶️ В работе: {name}",
+                callback_data=f"{CB_DAY_RESUME}:{who}",
+            )])
+        else:
+            buttons.append([InlineKeyboardButton(
+                text=f"⏸ Занят: {name}",
+                callback_data=f"{CB_DAY_PAUSE}:{who}",
+            )])
+    buttons.append([InlineKeyboardButton(
+        text="🔄 Обновить", callback_data=f"{CB_DAY_REFRESH}:0"
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def payout_text(crm_id: int, payout: str) -> str:

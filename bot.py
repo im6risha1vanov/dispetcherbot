@@ -8,10 +8,12 @@ from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, Message
 
+import access
 import closing
 import config
 import db
 import messages
+import migrate
 import photos
 import pinning
 import reporting
@@ -29,9 +31,13 @@ STEP_REPLY = {"enroute": "В пути", "onsite": "На месте", "inwork": "
 STEP_ICON = {"enroute": "🚗", "onsite": "📍", "inwork": "🔧"}
 
 
-async def _is_admin(message: Message) -> bool:
-    """Служебные команды: владелец, администратор и директор — все трое."""
-    return await roles.is_supervisor(message.chat.id)
+async def _may(message: Message, command: str) -> bool:
+    """Право на команду по отправителю, а не по чату.
+
+    В рабочем чате мастера сидят и мастер, и директор: чат про них обоих
+    ничего не говорит. Список прав — единый, в access.COMMANDS.
+    """
+    return await access.may(message.from_user, command)
 
 
 async def identify_master(user):
@@ -107,7 +113,7 @@ async def catch_admin_chat(handler, event: Message, data):
 @dp.message(Command("roles"))
 async def cmd_roles(message: Message) -> None:
     """Кто сейчас кто: владелец смотрит, администратор и директор решают."""
-    if not await _is_admin(message):
+    if not await _may(message, "roles"):
         return
     stored = await roles.admin_chat()
     if await roles.admin_bound():
@@ -127,6 +133,137 @@ async def cmd_roles(message: Message) -> None:
     )
 
 
+@dp.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    """Справка ровно по ролям отправителя: у мастера и директора она разная."""
+    found, master = await access.whois(message.from_user)
+    await message.answer(access.help_text(found, master))
+
+
+@dp.message(Command("today"))
+async def cmd_today(message: Message) -> None:
+    """Панель дня: кто в очереди, кто свободен, кого можно убрать."""
+    if not await _may(message, "today"):
+        return
+    found, _ = await access.whois(message.from_user)
+    await _show_roster(message.answer, is_director=access.DIRECTOR in found)
+
+
+async def _roster_rows():
+    day = datetime.now(config.TIMEZONE).date()
+    rows = await db.day_roster(day, config.CITY_ID, sorted(config.SILENT_STATUSES))
+    return day, rows
+
+
+async def _show_roster(send, *, is_director: bool) -> None:
+    day, rows = await _roster_rows()
+    await send(
+        messages.roster_text(day, rows),
+        reply_markup=messages.roster_keyboard(rows, is_director=is_director),
+    )
+
+
+async def _redraw_roster(callback: CallbackQuery, is_director: bool) -> None:
+    """Панель перерисовывается на месте: свежий снимок вместо простыни."""
+    day, rows = await _roster_rows()
+    try:
+        await callback.message.edit_text(
+            messages.roster_text(day, rows),
+            reply_markup=messages.roster_keyboard(rows, is_director=is_director),
+        )
+    except Exception:
+        log.debug("панель дня не перерисовалась", exc_info=True)
+
+
+async def _roster_actor(callback: CallbackQuery) -> set[str] | None:
+    found, _ = await access.whois(callback.from_user)
+    if not found & access.DECIDERS:
+        await callback.answer("Панель дня — для администратора и директора", show_alert=True)
+        return None
+    return found
+
+
+def _actor_title(found: set[str]) -> str:
+    return "директор" if access.DIRECTOR in found else "администратор"
+
+
+@dp.callback_query(F.data.startswith(f"{messages.CB_DAY_REFRESH}:"))
+async def on_day_refresh(callback: CallbackQuery) -> None:
+    found = await _roster_actor(callback)
+    if found is None:
+        return
+    await _redraw_roster(callback, access.DIRECTOR in found)
+    await callback.answer("Обновил")
+
+
+@dp.callback_query(F.data.startswith(f"{messages.CB_DAY_PAUSE}:"))
+async def on_day_pause(callback: CallbackQuery) -> None:
+    """«Занят» убирает мастера из очереди до конца дня. Выданное не забираем."""
+    found = await _roster_actor(callback)
+    if found is None:
+        return
+
+    employee_id = int(callback.data.split(":", 1)[1])
+    day = datetime.now(config.TIMEZONE).date()
+    master = await db.master_by_employee(employee_id)
+    if not await db.pause_master(day, employee_id):
+        await callback.answer("Он сегодня не отмечался — и так не в очереди", show_alert=True)
+        return
+
+    await _redraw_roster(callback, access.DIRECTOR in found)
+    await callback.answer("Убрал из очереди до конца дня")
+    await roles.notify_owner(
+        callback.bot,
+        f"🔀 {master['full_name']} → занят до конца дня ({_actor_title(found)})",
+    )
+    log.info("мастер %s помечен занятым на %s", master["full_name"], day)
+
+
+@dp.callback_query(F.data.startswith(f"{messages.CB_DAY_RESUME}:"))
+async def on_day_resume(callback: CallbackQuery) -> None:
+    """Вернуть в очередь. Не отмечался утром — встаёт в конец."""
+    found = await _roster_actor(callback)
+    if found is None:
+        return
+
+    employee_id = int(callback.data.split(":", 1)[1])
+    day = datetime.now(config.TIMEZONE).date()
+    master = await db.master_by_employee(employee_id)
+    position, _ = await db.resume_master(day, employee_id, config.CITY_ID)
+
+    await _redraw_roster(callback, access.DIRECTOR in found)
+    await callback.answer(f"В очереди, {position}-й")
+    await roles.notify_owner(
+        callback.bot,
+        f"🔀 {master['full_name']} → в очередь, {position}-й ({_actor_title(found)})",
+    )
+    log.info("мастер %s возвращён в очередь, позиция %s", master["full_name"], position)
+
+
+@dp.callback_query(F.data.startswith(f"{messages.CB_DAY_ENABLE}:"))
+async def on_day_enable(callback: CallbackQuery) -> None:
+    """Вернуть выключенного мастера в работу. Только директор."""
+    found = await _roster_actor(callback)
+    if found is None:
+        return
+    if access.DIRECTOR not in found:
+        await callback.answer("Включать мастеров может только директор", show_alert=True)
+        return
+
+    employee_id = int(callback.data.split(":", 1)[1])
+    master = await db.master_by_employee(employee_id)
+    if not await db.set_master_active(employee_id, True):
+        await callback.answer("Мастера нет в справочнике", show_alert=True)
+        return
+
+    await _redraw_roster(callback, True)
+    await callback.answer(f"{master['full_name']} снова в работе")
+    await roles.notify_owner(
+        callback.bot, f"✅ {master['full_name']} снова в работе (директор)"
+    )
+    log.info("мастер %s включён в работу директором", master["full_name"])
+
+
 @dp.message(Command("ping"))
 async def cmd_ping(message: Message) -> None:
     await message.answer("pong")
@@ -134,12 +271,14 @@ async def cmd_ping(message: Message) -> None:
 
 @dp.message(Command("chatid"))
 async def cmd_chatid(message: Message) -> None:
+    if not await _may(message, "chatid"):
+        return
     await message.answer(f"chat_id: {message.chat.id}\nВаш id: {message.from_user.id}")
 
 
 @dp.message(Command("masters"))
 async def cmd_masters(message: Message) -> None:
-    if not await _is_admin(message):
+    if not await _may(message, "masters"):
         return
     rows = await db.list_masters(config.CITY_ID)
     lines = []
@@ -155,7 +294,7 @@ async def cmd_masters(message: Message) -> None:
 
 @dp.message(Command("master_link"))
 async def cmd_master_link(message: Message, command: CommandObject) -> None:
-    if not await _is_admin(message):
+    if not await _may(message, "master_link"):
         return
     parts = (command.args or "").split()
     if len(parts) != 2 or not all(p.lstrip("-").isdigit() for p in parts):
@@ -172,7 +311,7 @@ async def cmd_master_link(message: Message, command: CommandObject) -> None:
 @dp.message(Command("master_user"))
 async def cmd_master_user(message: Message, command: CommandObject) -> None:
     """Прописывает @username заранее: бот привяжется сам, когда мастер напишет /start."""
-    if not await _is_admin(message):
+    if not await _may(message, "master_user"):
         return
     parts = (command.args or "").split()
     if len(parts) != 2 or not parts[0].isdigit():
@@ -192,6 +331,8 @@ async def cmd_master_user(message: Message, command: CommandObject) -> None:
 @dp.message(Command("master_chat"))
 async def cmd_master_chat(message: Message, command: CommandObject) -> None:
     """Вызывается в рабочем чате мастера: привязывает этот чат к нему."""
+    if not await _may(message, "master_chat"):
+        return
     if not (command.args or "").strip().isdigit():
         await message.answer(
             "Отправьте в рабочем чате мастера: /master_chat <employee_id>\n"
@@ -209,7 +350,7 @@ async def cmd_master_chat(message: Message, command: CommandObject) -> None:
 
 @dp.message(Command("master_off", "master_on"))
 async def cmd_master_toggle(message: Message, command: CommandObject) -> None:
-    if not await _is_admin(message):
+    if not await _may(message, "master_on"):
         return
     if not (command.args or "").strip().isdigit():
         await message.answer(f"Формат: /{command.command} <employee_id>")
@@ -231,6 +372,15 @@ async def on_shift(callback: CallbackQuery) -> None:
 
     master = await identify_master(callback.from_user)
     if master is None:
+        # Выключенный мастер есть в справочнике — ему нужна другая новость.
+        known = await db.master_by_telegram_any(callback.from_user.id)
+        if known is not None:
+            await callback.answer(
+                "Вы сейчас не в работе. Чтобы вернуться в смену, "
+                "попросите директора включить вас.",
+                show_alert=True,
+            )
+            return
         await callback.answer("Вас нет в списке мастеров — обратитесь к администратору", show_alert=True)
         return
 
@@ -1295,6 +1445,34 @@ async def _advance(callback: CallbackQuery, crm: CrmClient, state: str) -> None:
     log.info("заявка %s: %s отметил «%s»", crm_id, master["full_name"], state)
 
 
+async def _refuse_on_stale_schema(bot) -> bool:
+    """Устаревшая база — не запускаемся и объясняем человеку почему.
+
+    Пишем владельцу напрямую, а не через журнал: обработчик сбоев шлёт
+    сообщение отдельной задачей, а процесс успеет умереть раньше неё.
+    """
+    todo = migrate.pending(await db.applied_migrations())
+    if not todo:
+        return False
+
+    names = ", ".join(m.title for m in todo)
+    log.error("база устарела, не применены миграции: %s", names)
+    owner = roles.owner_chat()
+    if owner:
+        try:
+            await bot.send_message(
+                owner,
+                "🛑 Бот не запустился: база устарела\n\n"
+                f"Не применены миграции: {names}\n\n"
+                "Что делать: на сервере выполнить\n"
+                "  cd /opt/bt-dispatch-bot && .venv/bin/python migrate.py\n\n"
+                "Пока не применить — бот работать не будет.",
+            )
+        except Exception:
+            log.exception("не смог сообщить владельцу об устаревшей базе")
+    return True
+
+
 def _warn_if_unfenced() -> None:
     """Проведение включено на весь филиал — владелец должен об этом знать.
 
@@ -1348,6 +1526,10 @@ async def main() -> None:
 
     crm._download_file = download
     reporting.attach(bot, roles.owner_chat(), "боте")
+    if await _refuse_on_stale_schema(bot):
+        await bot.session.close()
+        await db.close()
+        raise SystemExit(1)
     _warn_if_unfenced()
     bot._crm_download = download  # СД пишется из своего клиента
 

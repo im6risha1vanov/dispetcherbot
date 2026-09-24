@@ -55,6 +55,19 @@ async def close() -> None:
     _pool = None
 
 
+def acquire():
+    """Соединение из пула для разовых задач вроде миграций."""
+    return _pool.acquire()
+
+
+async def applied_migrations() -> set[str]:
+    """Номера применённых миграций. Пусто, если учёт ещё не заведён."""
+    if await _pool.fetchval("SELECT to_regclass($1)", "public.schema_migrations") is None:
+        return set()
+    rows = await _pool.fetch("SELECT version FROM schema_migrations")
+    return {row["version"] for row in rows}
+
+
 async def insert_request(row, city_id: int, *, notified: bool, is_open: bool = True) -> bool:
     """Возвращает True, если заявка увидена впервые.
 
@@ -234,6 +247,39 @@ async def master_by_telegram(telegram_id: int) -> asyncpg.Record | None:
     )
 
 
+async def master_by_telegram_any(telegram_id: int) -> asyncpg.Record | None:
+    """Мастер по телеграму, включая выключенных.
+
+    Нужен, чтобы отличить «вас нет в справочнике» от «вы выключены»:
+    человеку это разные новости.
+    """
+    return await _pool.fetchrow(
+        "SELECT * FROM masters WHERE telegram_id = $1", telegram_id
+    )
+
+
+async def master_is_busy(employee_id: int, silent_statuses: list[str]) -> bool:
+    """Везёт ли мастер незакрытую заявку прямо сейчас.
+
+    Занятость из shift_slots годится только для тех, кто в очереди. Гарантия
+    идёт мимо очереди, поэтому её адресата спрашиваем отдельно.
+    """
+    return await _pool.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM assignments a
+            JOIN requests r USING (crm_id)
+            WHERE a.employee_id = $1
+              AND a.state <> 'reassigned'
+              AND r.is_open
+              AND NOT (r.status_text = ANY($2::text[]))
+        )
+        """,
+        employee_id,
+        silent_statuses,
+    )
+
+
 async def list_masters(city_id: int) -> list[asyncpg.Record]:
     return await _pool.fetch(
         "SELECT * FROM masters WHERE city_id = $1 ORDER BY full_name", city_id
@@ -339,6 +385,7 @@ async def shift_slots(shift_date, city_id: int, silent_statuses: list[str]) -> l
                ) AS is_busy
         FROM shifts s JOIN masters m USING (employee_id)
         WHERE s.shift_date = $1 AND s.city_id = $2 AND m.is_active
+          AND s.paused_at IS NULL
           AND m.employee_id <> ALL($4::bigint[])
           AND (m.telegram_id IS NULL OR m.telegram_id <> ALL($4::bigint[]))
         ORDER BY s.position
@@ -348,6 +395,84 @@ async def shift_slots(shift_date, city_id: int, silent_statuses: list[str]) -> l
         silent_statuses,
         skip,
     )
+
+
+async def day_roster(shift_date, city_id: int, silent_statuses: list[str]) -> list[asyncpg.Record]:
+    """Все мастера филиала на день: очередь, занятость, дневная пауза.
+
+    В отличие от shift_slots показывает и тех, кого в очереди нет: панель
+    дня должна отвечать не только «кому дать заявку», но и «почему не дали».
+    """
+    skip = list(_director_skip_ids())
+    return await _pool.fetch(
+        """
+        SELECT m.employee_id, m.full_name, m.is_active,
+               s.position, s.paused_at,
+               coalesce(m.chat_id, m.telegram_id) AS delivery_chat_id,
+               EXISTS (
+                   SELECT 1 FROM assignments a
+                   JOIN requests r USING (crm_id)
+                   WHERE a.employee_id = m.employee_id
+                     AND a.state <> 'reassigned'
+                     AND r.is_open
+                     AND NOT (r.status_text = ANY($3::text[]))
+               ) AS is_busy,
+               (
+                   SELECT a.crm_id FROM assignments a
+                   JOIN requests r USING (crm_id)
+                   WHERE a.employee_id = m.employee_id
+                     AND a.state <> 'reassigned'
+                     AND r.is_open
+                     AND NOT (r.status_text = ANY($3::text[]))
+                   ORDER BY a.id DESC LIMIT 1
+               ) AS busy_with
+        FROM masters m
+        LEFT JOIN shifts s
+               ON s.employee_id = m.employee_id AND s.shift_date = $1
+        WHERE m.city_id = $2
+          AND m.employee_id <> ALL($4::bigint[])
+          AND (m.telegram_id IS NULL OR m.telegram_id <> ALL($4::bigint[]))
+        ORDER BY m.is_active DESC, s.position NULLS LAST, m.full_name
+        """,
+        shift_date,
+        city_id,
+        silent_statuses,
+        skip,
+    )
+
+
+async def pause_master(shift_date, employee_id: int) -> bool:
+    """«Занят» до конца дня. False — мастер сегодня и так не в очереди.
+
+    Строку смены не заводим: она дала бы мастеру позицию в очереди, которой
+    у него не было.
+    """
+    updated = await _pool.fetchval(
+        """
+        UPDATE shifts SET paused_at = now()
+        WHERE shift_date = $1 AND employee_id = $2
+        RETURNING employee_id
+        """,
+        shift_date,
+        employee_id,
+    )
+    return updated is not None
+
+
+async def resume_master(shift_date, employee_id: int, city_id: int) -> tuple[int, bool]:
+    """Вернуть мастера в очередь. Не отмечался утром — встаёт в конец."""
+    cleared = await _pool.fetchval(
+        """
+        UPDATE shifts SET paused_at = NULL
+        WHERE shift_date = $1 AND employee_id = $2
+        RETURNING position
+        """,
+        shift_date,
+        employee_id,
+    )
+    if cleared is not None:
+        return cleared, False
+    return await mark_shift(shift_date, employee_id, city_id)
 
 
 async def get_pinned_message(employee_id: int) -> int | None:

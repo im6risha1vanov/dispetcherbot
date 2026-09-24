@@ -20,6 +20,23 @@ IMAGE_UPLOAD_PATH = "/admin/domain/customer-request/image-upload"
 
 CSRF_PARAM_FALLBACK = "_csrf-frontend"
 GRID_CELLS = 13
+
+# Подписи колонок грида, сняты с живой CRM 24.09.2026. Проверяем те, из
+# которых читаем: перестановка колонок при том же их числе опаснее новой
+# колонки — адрес молча ляжет в поле мастера, и ничего не упадёт.
+# Колонки 1-3 (пустая, «П», «Н») не читаются, их подписи не сверяем.
+GRID_COLUMNS = {
+    0: "ID",
+    4: "Время заявки",
+    5: "Тип",
+    6: "Статус",
+    7: "Имя клиента",
+    8: "Адрес",
+    9: "Мастер",
+    10: "Создано (лок)",
+    11: "Закрыто (лок)",
+    12: "Сумма",
+}
 USER_AGENT = "bt-dispatch-bot/1.0"
 
 FIELD_EMPLOYEE = "CustomerRequest[employee_id]"
@@ -75,6 +92,13 @@ class CrmAuthError(CrmError):
 
 class CrmParseError(CrmError):
     pass
+
+class CrmLayoutError(CrmParseError):
+    """Разметка грида разошлась с ожидаемой: разбирать нельзя, надо чинить код.
+
+    Отдельный класс, потому что реакция другая: сетевую заминку пережидают
+    пять опросов, а сдвинувшуюся колонку — никогда. Тревога уходит сразу.
+    """
 
 @dataclass(slots=True)
 class RequestRow:
@@ -179,17 +203,38 @@ def _parse_money(raw: str) -> Decimal | None:
         log.warning("не разобрал сумму %r", raw)
         return None
 
+def _check_grid_columns(table: Node) -> None:
+    """Сверяет подписи колонок грида. Расхождение — повод остановиться.
+
+    Пропускать строки нельзя: заявки тихо исчезнут из поля зрения бота,
+    а часть данных уедет не в то поле.
+    """
+    head = table.css_first("thead tr")
+    cells = head.css("th") if head is not None else []
+    if not cells:
+        raise CrmLayoutError("у таблицы грида нет заголовков — разметка CRM изменилась")
+
+    problems = []
+    if len(cells) != GRID_CELLS:
+        problems.append(f"колонок всего: ожидал {GRID_CELLS}, пришло {len(cells)}")
+    for index, expected in GRID_COLUMNS.items():
+        actual = _text(cells[index]) if index < len(cells) else ""
+        if actual != expected:
+            problems.append(f"колонка {index}: ожидал «{expected}», пришло «{actual}»")
+
+    if problems:
+        raise CrmLayoutError("\n".join(problems))
+
+
 def _parse_grid_row(tr: Node) -> RequestRow | None:
     key = tr.attributes.get("data-key") or ""
     if not key.isdigit():
         return None
     cells = [_text(td) for td in tr.css("td")]
     if len(cells) != GRID_CELLS:
-        log.error(
-            "заявка %s: ожидал %d ячеек, получил %d — разметка грида изменилась, строка пропущена",
-            key, GRID_CELLS, len(cells),
+        raise CrmLayoutError(
+            f"заявка {key}: ячеек в строке ожидал {GRID_CELLS}, пришло {len(cells)}"
         )
-        return None
 
     status_raw = cells[6]
     return RequestRow(
@@ -466,7 +511,14 @@ class CrmClient:
         table = tree.css_first(".grid-view table.table__tr-link")
         if table is None:
             raise CrmParseError("не нашёл таблицу грида заявок — разметка CRM изменилась")
-        rows = [row for tr in table.css("tbody tr[data-key]") if (row := _parse_grid_row(tr))]
+
+        _check_grid_columns(table)
+        found = table.css("tbody tr[data-key]")
+        rows = [row for tr in found if (row := _parse_grid_row(tr))]
+        if found and not rows:
+            raise CrmLayoutError(
+                f"в гриде {len(found)} строк, разобрать не удалось ни одну"
+            )
         log.debug("грид отдал %d заявок", len(rows))
         return rows
 

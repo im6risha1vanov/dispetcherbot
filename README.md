@@ -39,9 +39,22 @@ python3.11 -m venv .venv
 ```bash
 sudo -u postgres createuser btbot --pwprompt
 sudo -u postgres createdb btdispatch -O btbot
-psql "postgresql://btbot:ПАРОЛЬ@localhost:5432/btdispatch" -f migrations/001_init.sql
-psql "postgresql://btbot:ПАРОЛЬ@localhost:5432/btdispatch" -f migrations/002_dispatch.sql
+.venv/bin/python migrate.py
 ```
+
+`migrate.py` применяет неприменённые миграции по возрастанию номера, каждую
+в своей транзакции, и отмечает в таблице `schema_migrations`. Состояние —
+`migrate.py --status`.
+
+На базе, где миграции применяли руками до появления учёта, один раз нужно
+отметить уже применённое, не выполняя заново:
+
+```bash
+.venv/bin/python migrate.py --baseline 023
+```
+
+**Обе службы при старте проверяют, что неприменённых миграций нет.** Если
+есть — не запускаются и пишут владельцу в Telegram, что именно применить.
 
 Вторая миграция заводит справочник мастеров филиала из контракта. Уволенный
 мастер выключен сразу. Telegram каждому мастеру администратор привязывает
@@ -86,7 +99,7 @@ Telegram, ни в CRM — это безопасно гонять сколько 
 
 ```bash
 sudo -u postgres createdb btdispatch_test -O btbot
-psql "$TEST_DSN" -f migrations/001_init.sql && psql "$TEST_DSN" -f migrations/002_dispatch.sql
+DATABASE_URL="$TEST_DSN" .venv/bin/python migrate.py
 TEST_DATABASE_URL="$TEST_DSN" .venv/bin/pytest tests/test_db_integration.py
 ```
 
@@ -186,6 +199,8 @@ CRM, записываются как известные **без уведомл�
 Команды администратора (работают у владельца, администратора и директора):
 
 ```
+/help                                 справка по своей роли
+/today                                панель мастеров на сегодня
 /roles                                кто сейчас владелец, админ и директор
 /masters                              список мастеров и привязок
 /master_link <employee_id> <tg_id>    привязать телеграм мастера

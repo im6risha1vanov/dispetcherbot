@@ -11,7 +11,9 @@ from datetime import datetime, time
 @dataclass(slots=True, frozen=True)
 class ShiftSlot:
     employee_id: int
-    position: int
+    # None — мастер вне очереди: гарантия ушла ему мимо круга,
+    # и курсор круга двигать нельзя, иначе перескочит чужую позицию.
+    position: int | None
     full_name: str
     delivery_chat_id: int | None  # рабочий чат мастера; без него заявку доставить некуда
     username: str | None = None

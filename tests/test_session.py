@@ -18,7 +18,7 @@ LOGIN_PAGE = f"""<html><head>{CSRF}</head><body>
 AUTHED_PAGE = f'<html><head>{CSRF}</head><body><nav class="navbar"></nav></body></html>'
 
 GRID_PAGE = f"""<html><head>{CSRF}</head><body><nav class="navbar"></nav>
-<div class="grid-view"><table class="table__tr-link"><tbody>
+<div class="grid-view"><table class="table__tr-link"><thead><tr><th>ID</th><th></th><th>П</th><th>Н</th><th>Время заявки</th><th>Тип</th><th>Статус</th><th>Имя клиента</th><th>Адрес</th><th>Мастер</th><th>Создано (лок)</th><th>Закрыто (лок)</th><th>Сумма</th></tr></thead><tbody>
   <tr data-key="781594">
     <td class="col__id">781594</td><td class="col__check"></td><td class="col__check"></td>
     <td class="col__check"></td><td class="col__date col__openedAt">15.09.26 14:00</td>

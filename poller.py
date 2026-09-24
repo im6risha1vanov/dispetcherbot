@@ -12,11 +12,12 @@ import config
 import db
 import dispatch_queue
 import messages
+import migrate
 import photos
 import pinning
 import reporting
 import roles
-from crm import CrmClient, CrmError
+from crm import CrmClient, CrmError, CrmLayoutError
 
 log = logging.getLogger("poller")
 
@@ -221,7 +222,11 @@ async def maybe_send_digest(bot: Bot) -> None:
 
     totals = await db.daily_totals(now.date(), config.CITY_ID, sorted(config.DONE_STATUSES))
     leftovers = await db.day_leftovers(now.date(), config.CITY_ID, sorted(config.SILENT_STATUSES))
-    await notify_feed(bot, messages.digest_text(now.date(), totals, leftovers))
+    digest = messages.digest_text(now.date(), totals, leftovers)
+    await notify_feed(bot, digest)
+    if config.MASTERS_CHAT_ID:
+        # Мастера видят итоги целиком: так решил заказчик.
+        await roles.send_to(bot, [config.MASTERS_CHAT_ID], digest)
     await db.set_state(key, now.isoformat())
     log.info("дайджест за %s отправлен: заявок %s", now.date(), totals["orders"])
 
@@ -390,8 +395,16 @@ async def _escalate_to_director(crm_bot: Bot, crm: CrmClient, rec, slots) -> Non
 async def _bound_master(rec, prior_master: str, slots) -> tuple[object | None, bool]:
     """Мастер, за которым закреплена заявка. Второе значение — ждать ли его.
 
-    Гарантия возвращается тому, кто делал работу, и ждёт его сколько нужно.
-    Повтор идёт к нему же, но если он занят или не на смене — в общую очередь.
+    Гарантия идёт мимо очереди: тому, кто делал работу, даже если он утром
+    не отмечался или помечен «Занят» — это правила очереди, а не его
+    доступности. Занят заявкой — ждём, сколько нужно.
+
+    Если исходный мастер выключен или его нет в справочнике, гарантия
+    уходит в общую очередь с пометкой «первым был». Раньше она в этом
+    случае ждала вечно и не доставалась никому.
+
+    Повтор остаётся при прежнем правиле: к тому же мастеру, но только
+    если он в сегодняшней очереди и свободен.
     """
     if rec["req_type"] not in ("Гарантия", "Повтор") or not prior_master:
         return None, False
@@ -400,14 +413,36 @@ async def _bound_master(rec, prior_master: str, slots) -> tuple[object | None, b
     if master is None:
         log.warning("заявка %s: прошлый мастер %r не найден в справочнике",
                     rec["crm_id"], prior_master)
-        return None, rec["req_type"] == "Гарантия"
+        return None, False
 
     slot = next((s for s in slots if s.employee_id == master["employee_id"]), None)
-    if slot and not slot.is_busy and slot.delivery_chat_id:
-        return slot, False
+    if rec["req_type"] == "Повтор":
+        if slot and not slot.is_busy and slot.delivery_chat_id:
+            return slot, False
+        return None, False
 
-    # Гарантию чужому мастеру не отдаём даже ценой ожидания.
-    return None, rec["req_type"] == "Гарантия"
+    if not master["is_active"]:
+        log.info("заявка %s: гарантийный мастер %s выключен — отдаю по кругу",
+                 rec["crm_id"], prior_master)
+        return None, False
+
+    delivery = master["chat_id"] or master["telegram_id"]
+    if not delivery:
+        log.warning("заявка %s: гарантийному мастеру %s некуда доставить заявку",
+                    rec["crm_id"], prior_master)
+        return None, False
+
+    if await db.master_is_busy(master["employee_id"], sorted(config.SILENT_STATUSES)):
+        return None, True
+
+    return dispatch_queue.ShiftSlot(
+        employee_id=master["employee_id"],
+        position=slot.position if slot else None,
+        full_name=master["full_name"],
+        delivery_chat_id=delivery,
+        username=master["telegram_username"],
+        is_busy=False,
+    ), False
 
 
 async def assign_request(crm: CrmClient, bot: Bot, rec, slots: list[dispatch_queue.ShiftSlot]) -> bool:
@@ -457,7 +492,9 @@ async def assign_request(crm: CrmClient, bot: Bot, rec, slots: list[dispatch_que
 
     await db.save_message_ref(assignment_id, sent.chat.id, sent.message_id)
     await pinning.pin_assignment(bot, master.employee_id, sent.chat.id, sent.message_id)
-    await db.set_state(_rotation_key(day), str(master.position))
+    if master.position is not None:
+        # Гарантия ушла мимо очереди — курсор круга не двигаем.
+        await db.set_state(_rotation_key(day), str(master.position))
 
     try:
         damage = await crm.assign_master(rec["crm_id"], master.employee_id)
@@ -610,6 +647,60 @@ async def check_onsite_timeouts(bot: Bot) -> None:
         await db.mark_onsite_alert_sent(row["id"])
 
 
+async def _refuse_on_stale_schema(bot) -> bool:
+    """Устаревшая база — не запускаемся и объясняем человеку почему.
+
+    Пишем владельцу напрямую, а не через журнал: обработчик сбоев шлёт
+    сообщение отдельной задачей, а процесс успеет умереть раньше неё.
+    """
+    todo = migrate.pending(await db.applied_migrations())
+    if not todo:
+        return False
+
+    names = ", ".join(m.title for m in todo)
+    log.error("база устарела, не применены миграции: %s", names)
+    owner = roles.owner_chat()
+    if owner:
+        try:
+            await bot.send_message(
+                owner,
+                "🛑 Бот не запустился: база устарела\n\n"
+                f"Не применены миграции: {names}\n\n"
+                "Что делать: на сервере выполнить\n"
+                "  cd /opt/bt-dispatch-bot && .venv/bin/python migrate.py\n\n"
+                "Пока не применить — бот работать не будет.",
+            )
+        except Exception:
+            log.exception("не смог сообщить владельцу об устаревшей базе")
+    return True
+
+
+async def _grid_layout_alarm(bot: Bot, failure: Exception) -> None:
+    """Разметка грида разошлась с ожидаемой — это чинится только кодом.
+
+    Шлём подробности напрямую, а не через журнал: обработчик сбоев сжимает
+    сообщение в одну строку, а человеку нужно видеть, какая колонка уехала.
+    Повторяем не чаще раза в сутки — иначе каждую минуту опроса.
+    """
+    log.info("структура грида CRM изменилась: %s", failure)
+    key = f"grid_layout:{_today().date().isoformat()}"
+    if await db.get_state(key):
+        return
+
+    await alert(
+        bot,
+        "🛑 Структура грида CRM изменилась\n\n"
+        f"{failure}\n\n"
+        "Бот перестал читать заявки и не будет их раздавать, пока это не поправят.\n"
+        "Раздавайте вручную и сообщите мне — надо переписать разбор.",
+        director=True,
+    )
+    await db.record_failure(
+        "опросе CRM", "разметка CRM", "структура грида CRM изменилась", "error"
+    )
+    await db.set_state(key, _today().isoformat())
+
+
 def _install_signal_handlers(stop: asyncio.Event) -> None:
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -635,6 +726,11 @@ async def main() -> None:
     crm = CrmClient()
     bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
     reporting.attach(bot, roles.owner_chat(), "опросе CRM")
+    if await _refuse_on_stale_schema(bot):
+        await crm.close()
+        await bot.session.close()
+        await db.close()
+        raise SystemExit(1)
     log.info(
         "опрос каждые %d c, город %d, окно %s–%s, раздача за %d мин до визита, запись в CRM %s",
         config.POLL_INTERVAL_SEC,
@@ -652,6 +748,10 @@ async def main() -> None:
                     await poll_once(crm, bot)
                 else:
                     await seed_baseline(crm)
+            except CrmLayoutError as exc:
+                # Сдвинувшуюся колонку не пересидеть: тревога сразу,
+                # без порога «5 неудач подряд», и счётчик не трогаем.
+                await _grid_layout_alarm(bot, exc)
             except (CrmError, httpx.HTTPError) as exc:
                 # CRM иногда просто не отвечает вовремя. Одна заминка — не повод
                 # будить человека: тревожим, только если она не отвечает подряд.
